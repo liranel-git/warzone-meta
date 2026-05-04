@@ -99,7 +99,7 @@ export default function App() {
 
   return (
     <div style={styles.app}>
-      <Header stats={stats} onRefresh={fetchData} />
+      <Header stats={stats} />
 
       {usingMock && (
         <div style={styles.mockBanner}>
