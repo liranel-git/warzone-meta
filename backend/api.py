@@ -2,7 +2,7 @@
 
 import os
 import threading
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -79,8 +79,10 @@ def stats():
 
 
 @app.post("/api/pipeline/run")
-def run_pipeline():
-    """Trigger a fresh scrape + classify cycle manually (takes 30–120 s)."""
+def run_pipeline(x_pipeline_secret: str | None = Header(None)):
+    secret = os.environ.get("PIPELINE_SECRET")
+    if secret and x_pipeline_secret != secret:
+        raise HTTPException(401, "Invalid secret")
     t = threading.Thread(target=_run_pipeline, daemon=True)
     t.start()
     return {"message": "Pipeline started in background"}

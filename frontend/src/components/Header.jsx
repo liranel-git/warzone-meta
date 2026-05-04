@@ -4,11 +4,20 @@ export default function Header({ stats, onRefresh }) {
   const [refreshing, setRefreshing] = useState(false);
 
   async function handleRefresh() {
+    const secret = prompt("Enter refresh password:");
+    if (!secret) return;
     setRefreshing(true);
     try {
       const api = import.meta.env.VITE_API_URL ?? "";
-      await fetch(`${api}/api/pipeline/run`, { method: "POST" });
-      // Poll until last_scraped changes (simple approach: just reload after 60s)
+      const res = await fetch(`${api}/api/pipeline/run`, {
+        method: "POST",
+        headers: { "x-pipeline-secret": secret },
+      });
+      if (res.status === 401) {
+        alert("Wrong password.");
+        setRefreshing(false);
+        return;
+      }
       setTimeout(() => {
         onRefresh();
         setRefreshing(false);
