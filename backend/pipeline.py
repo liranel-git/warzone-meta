@@ -15,7 +15,12 @@ def run():
     init_db()
 
     # 1. Scrape
-    reddit_items = scrape_reddit()
+    # Reddit blocks cloud provider IPs (AWS/Railway) with 403 — only run locally
+    if os.environ.get("DISABLE_REDDIT") != "1":
+        reddit_items = scrape_reddit()
+    else:
+        print("[pipeline] Reddit disabled (cloud environment)")
+        reddit_items = []
     youtube_items = scrape_youtube()
     all_items = reddit_items + youtube_items
     print(f"[pipeline] total items: {len(all_items)}")
