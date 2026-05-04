@@ -1,3 +1,5 @@
+import { useState } from "react";
+
 const TIER_COLORS = {
   "Absolute Meta": { accent: "#ffd700", bg: "rgba(255,215,0,0.06)", label: "🏆 ABSOLUTE META" },
   Meta:            { accent: "#00e676", bg: "rgba(0,230,118,0.06)", label: "🔥 META" },
@@ -8,10 +10,11 @@ const TIER_COLORS = {
 
 const CLASS_ICONS = {
   AR: "🔫", SMG: "⚡", LMG: "🔩", Sniper: "🎯",
-  Shotgun: "💥", Marksman: "🏹", Pistol: "🔘", Melee: "🗡",
+  Shotgun: "💥", Marksman: "🏹", Pistol: "🔘",
 };
 
 export default function WeaponCard({ build }) {
+  const [expanded, setExpanded] = useState(false);
   const t = TIER_COLORS[build.tier] ?? TIER_COLORS.B;
 
   return (
@@ -34,7 +37,14 @@ export default function WeaponCard({ build }) {
       </div>
 
       {build.reasoning && (
-        <p style={styles.reasoning}>{build.reasoning}</p>
+        <div>
+          {expanded && (
+            <p style={styles.reasoning}>{build.reasoning}</p>
+          )}
+          <button style={styles.toggle} onClick={() => setExpanded(!expanded)}>
+            {expanded ? "Show less ▲" : "Show more ▼"}
+          </button>
+        </div>
       )}
 
       <div style={styles.footer}>
@@ -119,6 +129,16 @@ const styles = {
     color: "#8080a0",
     fontStyle: "italic",
     lineHeight: 1.5,
+    margin: "0 0 6px 0",
+  },
+  toggle: {
+    background: "none",
+    border: "none",
+    color: "#4fc3f7",
+    fontSize: 12,
+    cursor: "pointer",
+    padding: 0,
+    fontWeight: 600,
   },
   footer: {
     display: "flex",

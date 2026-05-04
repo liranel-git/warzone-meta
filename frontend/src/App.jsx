@@ -1,7 +1,9 @@
 import { useState, useEffect, useCallback } from "react";
 import Header from "./components/Header.jsx";
 import FilterBar from "./components/FilterBar.jsx";
+import SearchBar from "./components/SearchBar.jsx";
 import TierSection from "./components/TierSection.jsx";
+import WeaponCard from "./components/WeaponCard.jsx";
 
 const TIERS = ["Absolute Meta", "Meta", "A", "B", "F"];
 const API = import.meta.env.VITE_API_URL ?? "";
@@ -63,6 +65,7 @@ export default function App() {
   const [builds, setBuilds] = useState([]);
   const [stats, setStats] = useState(null);
   const [classFilter, setClassFilter] = useState("All");
+  const [search, setSearch] = useState("");
   const [loading, setLoading] = useState(true);
   const [usingMock, setUsingMock] = useState(false);
 
@@ -80,7 +83,6 @@ export default function App() {
       setStats(statsJson);
       setUsingMock(false);
     } catch {
-      // API not running yet — show mock data so the UI is still useful
       setBuilds(MOCK_BUILDS);
       setStats({ total: MOCK_BUILDS.length, by_tier: {}, last_scraped: null });
       setUsingMock(true);
@@ -91,11 +93,18 @@ export default function App() {
 
   useEffect(() => { fetchData(); }, [fetchData]);
 
-  const filtered = classFilter === "All"
+  // Apply class filter first, then search
+  const afterClassFilter = classFilter === "All"
     ? builds
     : builds.filter((b) => b.weapon_class === classFilter);
 
+  const query = search.trim().toLowerCase();
+  const filtered = query
+    ? afterClassFilter.filter((b) => b.weapon_name.toLowerCase().includes(query))
+    : afterClassFilter;
+
   const grouped = groupByTier(filtered);
+  const isSearching = query.length > 0;
 
   return (
     <div style={styles.app}>
@@ -108,13 +117,25 @@ export default function App() {
         </div>
       )}
 
-      <FilterBar selected={classFilter} onChange={setClassFilter} />
+      <div style={styles.controls}>
+        <FilterBar selected={classFilter} onChange={setClassFilter} />
+        <div style={styles.searchWrap}>
+          <SearchBar value={search} onChange={setSearch} />
+        </div>
+      </div>
 
       <main style={styles.main}>
         {loading ? (
           <div style={styles.loading}>Loading builds…</div>
         ) : filtered.length === 0 ? (
-          <div style={styles.empty}>No builds found. Run the pipeline to scrape fresh data.</div>
+          <div style={styles.empty}>
+            {isSearching ? `No weapons matching "${search}".` : "No builds found. Run the pipeline to scrape fresh data."}
+          </div>
+        ) : isSearching ? (
+          // Flat list when searching — no tier grouping
+          <div style={styles.searchResults}>
+            {filtered.map((b) => <WeaponCard key={b.id} build={b} />)}
+          </div>
         ) : (
           TIERS.map((tier) =>
             grouped[tier]?.length ? (
@@ -145,6 +166,20 @@ const styles = {
     padding: "10px 24px",
     textAlign: "center",
   },
+  controls: {
+    maxWidth: 1100,
+    margin: "0 auto",
+    width: "100%",
+    padding: "0 24px",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    flexWrap: "wrap",
+    gap: 12,
+  },
+  searchWrap: {
+    padding: "8px 0",
+  },
   main: {
     maxWidth: 1100,
     margin: "0 auto",
@@ -154,6 +189,11 @@ const styles = {
     flexDirection: "column",
     gap: 20,
     flex: 1,
+  },
+  searchResults: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 12,
   },
   loading: {
     textAlign: "center",
