@@ -29,7 +29,7 @@ app.add_middleware(
 )
 
 TIERS = ["Absolute Meta", "Meta", "A", "B", "F"]
-CLASSES = ["AR", "SMG", "LMG", "Sniper", "Shotgun", "Marksman", "Pistol", "Melee"]
+CLASSES = ["AR", "SMG", "LMG", "Sniper", "Shotgun", "Marksman", "Pistol"]
 
 
 def _run_pipeline():
