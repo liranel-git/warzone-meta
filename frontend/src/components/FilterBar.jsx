@@ -1,4 +1,4 @@
-const CLASSES = ["All", "AR", "SMG", "LMG", "Sniper", "Shotgun", "Marksman", "Pistol", "Melee"];
+const CLASSES = ["All", "AR", "SMG", "LMG", "Sniper", "Shotgun", "Marksman", "Pistol"];
 
 export default function FilterBar({ selected, onChange }) {
   return (
