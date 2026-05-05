@@ -30,6 +30,9 @@ app.add_middleware(
 
 TIERS = ["Absolute Meta", "Meta", "A", "B", "F"]
 CLASSES = ["AR", "SMG", "LMG", "Sniper", "Shotgun", "Marksman", "Pistol"]
+GAMES = ["Warzone", "BO7", "BO6", "MW3", "MW2"]
+PLAY_STYLES = ["Long Range", "Close Range", "Sniper", "Support",
+               "Hip Fire", "Tac-Stance", "Aggressive", "Lowest Recoil"]
 
 
 def _run_pipeline():
@@ -40,13 +43,12 @@ def _run_pipeline():
 @app.on_event("startup")
 def startup():
     init_db()
-    # Run pipeline daily at 06:00 UTC — picks up overnight community posts
     scheduler.add_job(
         _run_pipeline,
         CronTrigger(hour=6, minute=0),
         id="daily_pipeline",
         replace_existing=True,
-        misfire_grace_time=3600,  # if server was down, still run within 1 h of scheduled time
+        misfire_grace_time=3600,
     )
     scheduler.start()
     print("[scheduler] daily pipeline job registered — fires at 06:00 UTC")
@@ -59,14 +61,16 @@ def shutdown():
 
 @app.get("/api/builds")
 def list_builds(
-    tier: str | None = Query(None, description="Filter by tier"),
+    tier: str | None = Query(None),
     weapon_class: str | None = Query(None, alias="class"),
+    game: str | None = Query(None),
+    play_style: str | None = Query(None, alias="playStyle"),
 ):
     if tier and tier not in TIERS:
         raise HTTPException(400, f"tier must be one of: {TIERS}")
     if weapon_class and weapon_class not in CLASSES:
         raise HTTPException(400, f"class must be one of: {CLASSES}")
-    builds = get_builds(tier=tier, weapon_class=weapon_class)
+    builds = get_builds(tier=tier, weapon_class=weapon_class, game=game, play_style=play_style)
     return {"builds": builds}
 
 

@@ -3,8 +3,6 @@ import json
 import os
 from datetime import datetime
 
-# In production (Railway) use a mounted volume at /app/data so the DB
-# survives deploys. Locally falls back to the backend directory.
 _data_dir = os.environ.get("DB_DIR", os.path.dirname(__file__))
 DB_PATH = os.path.join(_data_dir, "warzone.db")
 
@@ -22,6 +20,8 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 weapon_name TEXT NOT NULL,
                 weapon_class TEXT NOT NULL,
+                game TEXT NOT NULL DEFAULT 'Warzone',
+                play_style TEXT,
                 tier TEXT NOT NULL,
                 attachments TEXT NOT NULL,
                 source_type TEXT NOT NULL,
@@ -34,9 +34,20 @@ def init_db():
                 updated_at TEXT DEFAULT (datetime('now'))
             )
         """)
+        # Migrations for existing databases
+        for col, definition in [
+            ("game", "TEXT NOT NULL DEFAULT 'Warzone'"),
+            ("play_style", "TEXT"),
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE builds ADD COLUMN {col} {definition}")
+            except Exception:
+                pass  # already exists
+        # Replace old unique index (weapon_name, weapon_class) with one that includes game
+        conn.execute("DROP INDEX IF EXISTS idx_weapon")
         conn.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_weapon
-            ON builds(weapon_name, weapon_class)
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_weapon_game
+            ON builds(weapon_name, weapon_class, game)
         """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS scrape_log (
@@ -50,32 +61,38 @@ def init_db():
 
 
 def upsert_build(build: dict):
-    """Insert or update a build, keeping the highest-confidence version."""
+    game = build.get("game", "Warzone")
     with get_conn() as conn:
         conn.execute("""
             INSERT INTO builds
-                (weapon_name, weapon_class, tier, attachments, source_type,
-                 source_url, source_title, confidence, reasoning, upvotes, updated_at)
+                (weapon_name, weapon_class, game, play_style, tier, attachments,
+                 source_type, source_url, source_title, confidence, reasoning, upvotes, updated_at)
             VALUES
-                (:weapon_name, :weapon_class, :tier, :attachments, :source_type,
-                 :source_url, :source_title, :confidence, :reasoning, :upvotes,
+                (:weapon_name, :weapon_class, :game, :play_style, :tier, :attachments,
+                 :source_type, :source_url, :source_title, :confidence, :reasoning, :upvotes,
                  datetime('now'))
-            ON CONFLICT(weapon_name, weapon_class) DO UPDATE SET
+            ON CONFLICT(weapon_name, weapon_class, game) DO UPDATE SET
                 tier        = CASE WHEN excluded.confidence > builds.confidence
-                                   THEN excluded.tier   ELSE builds.tier   END,
+                                   THEN excluded.tier        ELSE builds.tier        END,
                 attachments = CASE WHEN excluded.confidence > builds.confidence
                                    THEN excluded.attachments ELSE builds.attachments END,
                 reasoning   = CASE WHEN excluded.confidence > builds.confidence
-                                   THEN excluded.reasoning  ELSE builds.reasoning  END,
+                                   THEN excluded.reasoning   ELSE builds.reasoning   END,
+                play_style  = COALESCE(excluded.play_style, builds.play_style),
                 source_url   = excluded.source_url,
                 source_title = excluded.source_title,
                 confidence  = MAX(excluded.confidence, builds.confidence),
                 upvotes     = MAX(excluded.upvotes, builds.upvotes),
                 updated_at  = datetime('now')
-        """, {**build, "attachments": json.dumps(build["attachments"])})
+        """, {
+            **build,
+            "game": game,
+            "play_style": build.get("play_style"),
+            "attachments": json.dumps(build["attachments"]),
+        })
 
 
-def get_builds(tier: str | None = None, weapon_class: str | None = None) -> list[dict]:
+def get_builds(tier=None, weapon_class=None, game=None, play_style=None) -> list[dict]:
     sql = "SELECT * FROM builds WHERE 1=1"
     params = []
     if tier:
@@ -84,8 +101,15 @@ def get_builds(tier: str | None = None, weapon_class: str | None = None) -> list
     if weapon_class:
         sql += " AND weapon_class = ?"
         params.append(weapon_class)
+    if game:
+        sql += " AND game = ?"
+        params.append(game)
+    if play_style:
+        sql += " AND play_style = ?"
+        params.append(play_style)
 
-    tier_order = "CASE tier WHEN 'Absolute Meta' THEN 1 WHEN 'Meta' THEN 2 WHEN 'A' THEN 3 WHEN 'B' THEN 4 WHEN 'F' THEN 5 ELSE 6 END"
+    tier_order = ("CASE tier WHEN 'Absolute Meta' THEN 1 WHEN 'Meta' THEN 2 "
+                  "WHEN 'A' THEN 3 WHEN 'B' THEN 4 WHEN 'F' THEN 5 ELSE 6 END")
     sql += f" ORDER BY {tier_order}, confidence DESC"
 
     with get_conn() as conn:
