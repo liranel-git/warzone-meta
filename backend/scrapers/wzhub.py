@@ -197,9 +197,9 @@ WARZONE_BUILDS = [
     # ══════════════════════════════════════════════════════
     # B TIER (Unrated / Below Meta)
     # ══════════════════════════════════════════════════════
-    {"weapon_name":"HDR","weapon_class":"Sniper","game":"Warzone","play_style":"Sniper","tier":"B","confidence":0.62,
+    {"weapon_name":"HDR","weapon_class":"Sniper","game":"Warzone","play_style":"Sniper","tier":"A","confidence":0.68,
      "attachments":["Muzzle: Monolithic Suppressor","Barrel: Gain-Twist Barrel","Underbarrel: Lightweight Bipod","Rear Grip: Quickdraw Grip","Fire Mods: 108MM Overpressured"],
-     "reasoning":"Classic WZ1 sniper. Outclassed by BO7 snipers but functional in a pinch."},
+     "reasoning":"Classic WZ1 sniper. Still listed as Acceptable — works at range but slower than BO7 options."},
     {"weapon_name":"Rival-9","weapon_class":"SMG","game":"Warzone","play_style":"Close Range","tier":"B","confidence":0.60,
      "attachments":["Muzzle: Shadowstrike Suppressor S","Underbarrel: XRK Edge BW-4 Handstop","Magazine: 40 Round Mag","Rear Grip: Rival Vice Assault Grip","Stock: EXF Close Quarters Assault Stock"],
      "reasoning":"Was meta in its season. Now outclassed by BO7 SMGs."},
@@ -338,9 +338,12 @@ WARZONE_BUILDS = [
     {"weapon_name":"AMR Mod 4","weapon_class":"Sniper","game":"Warzone","play_style":"Sniper","tier":"B","confidence":0.55,
      "attachments":["Muzzle: Muzzle Brake","Barrel: Reinforced Barrel","Magazine: Fast Mag I","Rear Grip: Quickdraw Grip","Laser: Target Laser","Fire Mods: Rapid Fire","Comb: Heavy Riser","Stock Pad: Precision Pad"],
      "reasoning":"Legacy sniper. Too many attachments needed to make it viable compared to newer options."},
-    {"weapon_name":"Holger 556 (Alt)","weapon_class":"AR","game":"Warzone","play_style":"Long Range","tier":"B","confidence":0.55,
-     "attachments":["Optic: JAK Glassless Optic","Muzzle: VT-7 Spiritfire Suppressor","Barrel: Chrios-6 Match","Underbarrel: Bruen Heavy Support Grip","Magazine: 40 Round Mag"],
-     "reasoning":"Same as primary Holger 556 — included for alternative build reference."},
+    {"weapon_name":"Crossbow","weapon_class":"Marksman","game":"Warzone","play_style":"Sniper","tier":"B","confidence":0.50,
+     "attachments":["Optic: Corio Eagleseye 2.5X","Underbarrel: FTAC Ripper 56","Cable: 28-Strand Cable","Bolt: Blastcap 20\" Bolts","Arms: SO Momenti"],
+     "reasoning":"Niche crossbow. Fun to use but limited viability against armored targets in BR."},
+    {"weapon_name":"D1.3 Sector","weapon_class":"SMG","game":"Warzone","play_style":"Close Range","tier":"B","confidence":0.50,
+     "attachments":["Barrel: Long Barrel","Underbarrel: Crossbar","Magazine: Explosive Blades","Stock: Overclocked Stock"],
+     "reasoning":"Unique special-ammo SMG. Interesting gimmick but inconsistent damage output."},
 ]
 
 
