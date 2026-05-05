@@ -13,9 +13,21 @@ const CLASS_ICONS = {
   Shotgun: "💥", Marksman: "🏹", Pistol: "🔘",
 };
 
+const PLAY_STYLE_MAPS = {
+  "Long Range":     ["Verdansk", "Haven's Hollow"],
+  "Sniper":         ["Verdansk"],
+  "Support":        ["Verdansk", "Haven's Hollow"],
+  "Lowest Recoil":  ["Verdansk", "Haven's Hollow"],
+  "Close Range":    ["Astra Malorum", "Haven's Hollow"],
+  "Hip Fire":       ["Astra Malorum"],
+  "Aggressive":     ["Astra Malorum", "Haven's Hollow"],
+};
+
 export default function WeaponCard({ build }) {
   const [expanded, setExpanded] = useState(false);
+  const [showMaps, setShowMaps] = useState(false);
   const t = TIER_COLORS[build.tier] ?? TIER_COLORS.B;
+  const bestMaps = PLAY_STYLE_MAPS[build.play_style] ?? null;
 
   return (
     <div style={{ ...styles.card, borderColor: t.accent, background: `linear-gradient(135deg, ${t.bg}, #13131f)` }}>
@@ -36,6 +48,24 @@ export default function WeaponCard({ build }) {
         ))}
       </div>
 
+      {bestMaps && (
+        <div>
+          <button style={styles.toggle} onClick={() => setShowMaps(!showMaps)}>
+            {showMaps ? "▾ Best Maps" : "▸ Best Maps"}
+          </button>
+          {showMaps && (
+            <div style={styles.mapsRow}>
+              {bestMaps.map((m) => (
+                <span key={m} style={styles.mapChip}>🗺 {m}</span>
+              ))}
+              {build.play_style && (
+                <span style={styles.styleNote}>{build.play_style} loadout</span>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
       {build.reasoning && (
         <div>
           {expanded && (
@@ -49,7 +79,7 @@ export default function WeaponCard({ build }) {
 
       <div style={styles.footer}>
         <span style={styles.source}>
-          {build.source_type === "youtube" ? "▶ YouTube" : "💬 Reddit"}
+          {build.source_type === "website" ? "🌐" : build.source_type === "youtube" ? "▶ YouTube" : "💬 Reddit"}
           {build.source_title ? ` · ${build.source_title.slice(0, 48)}${build.source_title.length > 48 ? "…" : ""}` : ""}
         </span>
         {build.source_url && (
@@ -123,6 +153,26 @@ const styles = {
     padding: "3px 10px",
     fontSize: 12,
     color: "#c0c0d8",
+  },
+  mapsRow: {
+    display: "flex",
+    flexWrap: "wrap",
+    gap: 6,
+    marginTop: 6,
+    alignItems: "center",
+  },
+  mapChip: {
+    background: "#0d1f2a",
+    border: "1px solid #1a3a4a",
+    borderRadius: 6,
+    padding: "3px 10px",
+    fontSize: 12,
+    color: "#4fc3f7",
+  },
+  styleNote: {
+    fontSize: 11,
+    color: "#4a4a6a",
+    marginLeft: 4,
   },
   reasoning: {
     fontSize: 13,
