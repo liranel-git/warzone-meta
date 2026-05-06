@@ -7,6 +7,7 @@ Two modes:
 """
 
 import os
+import concurrent.futures
 from dotenv import load_dotenv
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
@@ -16,6 +17,11 @@ from scrapers.wzhub import scrape as scrape_wzhub
 from scrapers.youtube_gemini import scrape as scrape_youtube_gemini
 from scrapers.gemini_site import scrape_codmunity, scrape_wzstats
 
+# Codmunity + WZ Meta site scraping via Gemini URL-context is currently
+# unreliable (calls hang past their nominal timeout). Disable for now —
+# the data still flows from wzhub.gg + the eight YouTube channels.
+ENABLE_GEMINI_SITES = os.environ.get("ENABLE_GEMINI_SITES", "0") == "1"
+
 
 def _run_with_youtube_lookback(lookback_days: int, label: str):
     import sys
@@ -24,23 +30,45 @@ def _run_with_youtube_lookback(lookback_days: int, label: str):
 
     builds: list[dict] = []
 
-    def step(name, fn):
+    def step(name, fn, hard_timeout_s):
+        """Run a scraper with a HARD timeout. If it doesn't finish in time,
+        we abandon the future and continue — the daemon thread will be
+        cleaned up when the worker exits."""
         t0 = time.time()
-        print(f"[pipeline] >>> starting {name}", flush=True)
+        print(f"[pipeline] >>> starting {name} (hard-timeout {hard_timeout_s}s)", flush=True)
         sys.stdout.flush()
-        try:
-            res = fn()
-            elapsed = time.time() - t0
-            print(f"[pipeline] <<< {name}: {len(res)} builds ({elapsed:.1f}s)", flush=True)
-            builds.extend(res)
-        except Exception as e:
-            elapsed = time.time() - t0
-            print(f"[pipeline] !!! {name} FAILED after {elapsed:.1f}s: {type(e).__name__}: {e}", flush=True)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(fn)
+            try:
+                res = fut.result(timeout=hard_timeout_s)
+            except concurrent.futures.TimeoutError:
+                elapsed = time.time() - t0
+                print(f"[pipeline] !!! {name} TIMED OUT after {elapsed:.1f}s — moving on", flush=True)
+                # don't wait for the abandoned thread on shutdown
+                ex._threads.clear()
+                concurrent.futures.thread._threads_queues.clear()
+                return
+            except Exception as e:
+                elapsed = time.time() - t0
+                print(f"[pipeline] !!! {name} FAILED after {elapsed:.1f}s: {type(e).__name__}: {e}", flush=True)
+                return
+        elapsed = time.time() - t0
+        print(f"[pipeline] <<< {name}: {len(res)} builds ({elapsed:.1f}s)", flush=True)
+        builds.extend(res)
 
-    step("wzhub", scrape_wzhub)
-    step("codmunity", scrape_codmunity)
-    step("wzstats", scrape_wzstats)
-    step("youtube_gemini", lambda: scrape_youtube_gemini(lookback_days=lookback_days))
+    step("wzhub", scrape_wzhub, hard_timeout_s=30)
+
+    if ENABLE_GEMINI_SITES:
+        step("codmunity", scrape_codmunity, hard_timeout_s=90)
+        step("wzstats", scrape_wzstats, hard_timeout_s=90)
+    else:
+        print("[pipeline] codmunity + wzstats SKIPPED (set ENABLE_GEMINI_SITES=1 to enable)", flush=True)
+
+    step(
+        "youtube_gemini",
+        lambda: scrape_youtube_gemini(lookback_days=lookback_days),
+        hard_timeout_s=60 * 30,  # 30 min cap for the entire YouTube pass
+    )
 
     if not builds:
         print(f"[pipeline] {label}: nothing to upsert")
