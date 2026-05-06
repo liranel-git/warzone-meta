@@ -29,13 +29,24 @@ CHANNELS = [
 
 DEFAULT_LOOKBACK_DAYS = 7
 GEMINI_MODEL = "gemini-2.5-flash"
+# Token-saving strategy: WZ creators almost always show their loadout
+# either at the start (intro/loadout reveal) or end (recap) of the video.
+# So instead of sending the entire video to Gemini we clip just two
+# windows — first HEAD_S seconds and last TAIL_S seconds — using
+# videoMetadata.start_offset/end_offset. This typically cuts per-video
+# token usage by 5–10×.
+HEAD_S = 90
+TAIL_S = 90
+# Skip the tail if the gap between head and tail would be less than this
+# (otherwise we'd be sending overlapping clips for short videos).
+MIN_GAP_S = 30
 # Stay well under the free-tier 250K input-tokens-per-minute cap.
-# A single Warzone video typically costs 50–150K tokens — pace so a burst
-# of videos can't spike past the limit.
-SLEEP_BETWEEN_CALLS_S = 15.0
-MAX_VIDEOS_PER_CHANNEL = 3
+SLEEP_BETWEEN_CALLS_S = 8.0
+MAX_VIDEOS_PER_CHANNEL = 5
 
-EXTRACTION_PROMPT = """You are analysing a Call of Duty: Warzone meta build video. Extract every distinct weapon build that the creator showcases or recommends.
+EXTRACTION_PROMPT = """You are analysing a Call of Duty: Warzone meta build video. The footage you see is the BEGINNING and END of the video — the segments where creators typically show their loadouts or summarise their picks.
+
+Extract every distinct weapon build the creator showcases or recommends.
 
 For each build, return strict JSON with these fields:
 - weapon_name (string, exact in-game name)
@@ -101,6 +112,40 @@ def _list_recent_videos(youtube, channel_id: str, after: str) -> list[dict]:
     return out
 
 
+_DURATION_RE = re.compile(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?")
+
+
+def _parse_iso_duration(s: str) -> int:
+    """ISO 8601 PT5M30S → 330 seconds. Returns 0 if unparseable."""
+    if not s:
+        return 0
+    m = _DURATION_RE.match(s)
+    if not m:
+        return 0
+    h, mi, sec = (int(x) if x else 0 for x in m.groups())
+    return h * 3600 + mi * 60 + sec
+
+
+def _fetch_durations(youtube, video_ids: list[str]) -> dict[str, int]:
+    """Batch-fetch duration in seconds for up to 50 videos at a time."""
+    out: dict[str, int] = {}
+    for i in range(0, len(video_ids), 50):
+        batch = video_ids[i:i + 50]
+        try:
+            resp = youtube.videos().list(
+                part="contentDetails", id=",".join(batch)
+            ).execute()
+            for item in resp.get("items", []):
+                vid = item["id"]
+                dur = _parse_iso_duration(
+                    item.get("contentDetails", {}).get("duration", "")
+                )
+                out[vid] = dur
+        except Exception as e:
+            print(f"[yt-gem] videos.list contentDetails failed: {e}")
+    return out
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Gemini extraction
 # ──────────────────────────────────────────────────────────────────────────
@@ -120,14 +165,42 @@ def _extract_json(text: str) -> dict:
         return {"builds": []}
 
 
-def _gemini_extract(video_url: str, client, max_retries: int = 2) -> list[dict]:
+def _build_clipped_content(video_url: str, duration_s: int):
+    """Build a Content with the first HEAD_S and last TAIL_S of the video,
+    instead of the whole thing — drastically reduces input tokens."""
+    from google.genai import types
+
+    parts = []
+
+    if not duration_s or duration_s <= HEAD_S + MIN_GAP_S:
+        # Short video / unknown length — analyse the whole thing.
+        parts.append(types.Part(file_data=types.FileData(file_uri=video_url)))
+    else:
+        head_end = min(HEAD_S, duration_s)
+        parts.append(types.Part(
+            file_data=types.FileData(file_uri=video_url),
+            video_metadata=types.VideoMetadata(
+                start_offset=f"0s", end_offset=f"{head_end}s"
+            ),
+        ))
+        # Tail: only add if it doesn't overlap with the head.
+        tail_start = max(head_end + MIN_GAP_S, duration_s - TAIL_S)
+        if tail_start < duration_s:
+            parts.append(types.Part(
+                file_data=types.FileData(file_uri=video_url),
+                video_metadata=types.VideoMetadata(
+                    start_offset=f"{tail_start}s", end_offset=f"{duration_s}s"
+                ),
+            ))
+
+    parts.append(types.Part(text=EXTRACTION_PROMPT))
+    return types.Content(parts=parts)
+
+
+def _gemini_extract(video_url: str, duration_s: int, client, max_retries: int = 2) -> list[dict]:
     """Send a YouTube URL to Gemini and return its parsed builds list.
     Retries on 429 (rate limit) with backoff parsed from the error if available."""
-    from google.genai import types
-    contents = types.Content(parts=[
-        types.Part(file_data=types.FileData(file_uri=video_url)),
-        types.Part(text=EXTRACTION_PROMPT),
-    ])
+    contents = _build_clipped_content(video_url, duration_s)
 
     for attempt in range(max_retries + 1):
         try:
@@ -213,12 +286,16 @@ def scrape(lookback_days: int = DEFAULT_LOOKBACK_DAYS) -> list[dict]:
         videos = videos[:MAX_VIDEOS_PER_CHANNEL]
         print(f"[yt-gem] {channel['name']}: processing {len(videos)} most-recent videos in last {lookback_days}d")
 
+        # Batch-fetch durations so we can clip head + tail.
+        durations = _fetch_durations(youtube, [v["videoId"] for v in videos])
+
         # Per-channel dedupe: weapon_name → first build seen (newest wins because list is sorted)
         seen: dict[str, dict] = {}
 
         for v in videos:
             url = f"https://youtube.com/watch?v={v['videoId']}"
-            builds = _gemini_extract(url, gemini)
+            dur_s = durations.get(v["videoId"], 0)
+            builds = _gemini_extract(url, dur_s, gemini)
             time.sleep(SLEEP_BETWEEN_CALLS_S)
 
             for b in builds:
