@@ -18,41 +18,29 @@ from scrapers.gemini_site import scrape_codmunity, scrape_wzstats
 
 
 def _run_with_youtube_lookback(lookback_days: int, label: str):
+    import sys
+    import time
     init_db()
 
     builds: list[dict] = []
 
-    # 1. wzhub.gg — embedded dataset, always fresh
-    try:
-        wzhub_builds = scrape_wzhub()
-        print(f"[pipeline] wzhub: {len(wzhub_builds)}")
-        builds.extend(wzhub_builds)
-    except Exception as e:
-        print(f"[pipeline] wzhub failed: {e}")
+    def step(name, fn):
+        t0 = time.time()
+        print(f"[pipeline] >>> starting {name}", flush=True)
+        sys.stdout.flush()
+        try:
+            res = fn()
+            elapsed = time.time() - t0
+            print(f"[pipeline] <<< {name}: {len(res)} builds ({elapsed:.1f}s)", flush=True)
+            builds.extend(res)
+        except Exception as e:
+            elapsed = time.time() - t0
+            print(f"[pipeline] !!! {name} FAILED after {elapsed:.1f}s: {type(e).__name__}: {e}", flush=True)
 
-    # 2. codmunity.gg — Gemini URL context
-    try:
-        cod_builds = scrape_codmunity()
-        print(f"[pipeline] codmunity: {len(cod_builds)}")
-        builds.extend(cod_builds)
-    except Exception as e:
-        print(f"[pipeline] codmunity failed: {e}")
-
-    # 3. wzstats.gg — Gemini URL context
-    try:
-        wzs_builds = scrape_wzstats()
-        print(f"[pipeline] wzstats: {len(wzs_builds)}")
-        builds.extend(wzs_builds)
-    except Exception as e:
-        print(f"[pipeline] wzstats failed: {e}")
-
-    # 4. YouTube channels via Gemini visual extraction
-    try:
-        yt_builds = scrape_youtube_gemini(lookback_days=lookback_days)
-        print(f"[pipeline] youtube ({lookback_days}d): {len(yt_builds)}")
-        builds.extend(yt_builds)
-    except Exception as e:
-        print(f"[pipeline] youtube failed: {e}")
+    step("wzhub", scrape_wzhub)
+    step("codmunity", scrape_codmunity)
+    step("wzstats", scrape_wzstats)
+    step("youtube_gemini", lambda: scrape_youtube_gemini(lookback_days=lookback_days))
 
     if not builds:
         print(f"[pipeline] {label}: nothing to upsert")

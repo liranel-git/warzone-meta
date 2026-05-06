@@ -162,7 +162,11 @@ def scrape(lookback_days: int = DEFAULT_LOOKBACK_DAYS) -> list[dict]:
         return []
 
     try:
-        gemini = genai.Client(api_key=gem_key)
+        from google.genai import types as gtypes
+        gemini = genai.Client(
+            api_key=gem_key,
+            http_options=gtypes.HttpOptions(timeout=120_000),  # 2 min per video
+        )
     except Exception as e:
         print(f"[yt-gem] failed to construct Gemini client: {e}")
         return []

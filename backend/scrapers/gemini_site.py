@@ -46,12 +46,21 @@ def scrape_site(url: str, play_style: str, source_title: str) -> list[dict]:
     try:
         from google import genai
         from google.genai import types
-    except ImportError:
-        print("[gem-site] google-genai package missing, skipping")
+    except ImportError as e:
+        print(f"[gem-site] google-genai package missing ({e}), skipping {url}")
         return []
 
-    client = genai.Client(api_key=gem_key)
+    try:
+        # 60-second per-request timeout so a hanging call can't kill the pipeline
+        client = genai.Client(
+            api_key=gem_key,
+            http_options=types.HttpOptions(timeout=60_000),
+        )
+    except Exception as e:
+        print(f"[gem-site] failed to construct client for {url}: {e}")
+        return []
 
+    print(f"[gem-site] requesting {url} …")
     try:
         resp = client.models.generate_content(
             model=GEMINI_MODEL,
@@ -60,9 +69,12 @@ def scrape_site(url: str, play_style: str, source_title: str) -> list[dict]:
                 tools=[types.Tool(url_context=types.UrlContext())],
             ),
         )
-        text = resp.text or ""
+        text = (resp.text or "").strip()
+        if not text:
+            print(f"[gem-site] empty response for {url}")
+            return []
     except Exception as e:
-        print(f"[gem-site] gemini call failed for {url}: {e}")
+        print(f"[gem-site] gemini call failed for {url}: {type(e).__name__}: {e}")
         return []
 
     parsed = _extract_json(text)
