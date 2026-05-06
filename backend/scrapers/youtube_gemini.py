@@ -213,7 +213,8 @@ def _gemini_extract(video_url: str, duration_s: int, client, max_retries: int = 
             builds = parsed.get("builds", [])
             if not isinstance(builds, list):
                 return []
-            print(f"[yt-gem]   {video_url}: {len(builds)} builds")
+            names = ", ".join(b.get("weapon_name", "?") for b in builds[:5])
+            print(f"[yt-gem]   {video_url}: {len(builds)} builds [{names}]")
             return builds
         except Exception as e:
             err_msg = str(e)
