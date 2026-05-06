@@ -115,24 +115,28 @@ def _extract_json(text: str) -> dict:
         return {"builds": []}
 
 
-def _gemini_extract(video_url: str, model) -> list[dict]:
+def _gemini_extract(video_url: str, client) -> list[dict]:
     """Send a YouTube URL to Gemini and return its parsed builds list."""
     try:
         from google.genai import types
         contents = types.Content(parts=[
-            types.Part(file_data=types.FileData(file_uri=video_url, mime_type="video/*")),
+            types.Part(file_data=types.FileData(file_uri=video_url)),
             types.Part(text=EXTRACTION_PROMPT),
         ])
-        resp = model.models.generate_content(model=GEMINI_MODEL, contents=contents)
-        text = resp.text or ""
+        resp = client.models.generate_content(model=GEMINI_MODEL, contents=contents)
+        text = (resp.text or "").strip()
+        if not text:
+            print(f"[yt-gem] empty response for {video_url}")
+            return []
     except Exception as e:
-        print(f"[yt-gem] gemini call failed for {video_url}: {e}")
+        print(f"[yt-gem] gemini call failed for {video_url}: {type(e).__name__}: {e}")
         return []
 
     parsed = _extract_json(text)
     builds = parsed.get("builds", [])
     if not isinstance(builds, list):
         return []
+    print(f"[yt-gem]   {video_url}: {len(builds)} builds")
     return builds
 
 
@@ -152,11 +156,17 @@ def scrape(lookback_days: int = DEFAULT_LOOKBACK_DAYS) -> list[dict]:
 
     try:
         from google import genai
-    except ImportError:
-        print("[yt-gem] google-genai package missing, skipping")
+        print(f"[yt-gem] google-genai package loaded OK")
+    except ImportError as e:
+        print(f"[yt-gem] google-genai package missing ({e}), skipping")
         return []
 
-    gemini = genai.Client(api_key=gem_key)
+    try:
+        gemini = genai.Client(api_key=gem_key)
+    except Exception as e:
+        print(f"[yt-gem] failed to construct Gemini client: {e}")
+        return []
+
     youtube = ytbuild("youtube", "v3", developerKey=yt_key, cache_discovery=False)
     after = _published_after(lookback_days)
 

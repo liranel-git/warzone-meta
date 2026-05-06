@@ -3,13 +3,18 @@ import { useNavigate } from "react-router-dom";
 export default function Header({ stats }) {
   const navigate = useNavigate();
 
+  const fmt = (iso) =>
+    new Date(iso).toLocaleString("en-GB", {
+      timeZone: "Asia/Jerusalem",
+      day: "2-digit", month: "2-digit", year: "numeric",
+      hour: "2-digit", minute: "2-digit",
+    }) + " (Jerusalem)";
+
   const lastUpdated = stats?.last_scraped
-    ? new Date(stats.last_scraped + "Z").toLocaleString()
+    ? fmt(stats.last_scraped + "Z")
     : "Never";
 
-  const nextScrape = stats?.next_scrape
-    ? new Date(stats.next_scrape).toLocaleString()
-    : null;
+  const nextScrape = stats?.next_scrape ? fmt(stats.next_scrape) : null;
 
   return (
     <header style={styles.header}>
