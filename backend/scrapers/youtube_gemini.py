@@ -29,6 +29,11 @@ CHANNELS = [
 
 DEFAULT_LOOKBACK_DAYS = 7
 GEMINI_MODEL = "gemini-2.5-flash"
+# Stay well under the free-tier 250K input-tokens-per-minute cap.
+# A single Warzone video typically costs 50–150K tokens — pace so a burst
+# of videos can't spike past the limit.
+SLEEP_BETWEEN_CALLS_S = 15.0
+MAX_VIDEOS_PER_CHANNEL = 3
 
 EXTRACTION_PROMPT = """You are analysing a Call of Duty: Warzone meta build video. Extract every distinct weapon build that the creator showcases or recommends.
 
@@ -115,29 +120,50 @@ def _extract_json(text: str) -> dict:
         return {"builds": []}
 
 
-def _gemini_extract(video_url: str, client) -> list[dict]:
-    """Send a YouTube URL to Gemini and return its parsed builds list."""
-    try:
-        from google.genai import types
-        contents = types.Content(parts=[
-            types.Part(file_data=types.FileData(file_uri=video_url)),
-            types.Part(text=EXTRACTION_PROMPT),
-        ])
-        resp = client.models.generate_content(model=GEMINI_MODEL, contents=contents)
-        text = (resp.text or "").strip()
-        if not text:
-            print(f"[yt-gem] empty response for {video_url}")
-            return []
-    except Exception as e:
-        print(f"[yt-gem] gemini call failed for {video_url}: {type(e).__name__}: {e}")
-        return []
+def _gemini_extract(video_url: str, client, max_retries: int = 2) -> list[dict]:
+    """Send a YouTube URL to Gemini and return its parsed builds list.
+    Retries on 429 (rate limit) with backoff parsed from the error if available."""
+    from google.genai import types
+    contents = types.Content(parts=[
+        types.Part(file_data=types.FileData(file_uri=video_url)),
+        types.Part(text=EXTRACTION_PROMPT),
+    ])
 
-    parsed = _extract_json(text)
-    builds = parsed.get("builds", [])
-    if not isinstance(builds, list):
-        return []
-    print(f"[yt-gem]   {video_url}: {len(builds)} builds")
-    return builds
+    for attempt in range(max_retries + 1):
+        try:
+            resp = client.models.generate_content(model=GEMINI_MODEL, contents=contents)
+            text = (resp.text or "").strip()
+            if not text:
+                print(f"[yt-gem] empty response for {video_url}")
+                return []
+            parsed = _extract_json(text)
+            builds = parsed.get("builds", [])
+            if not isinstance(builds, list):
+                return []
+            print(f"[yt-gem]   {video_url}: {len(builds)} builds")
+            return builds
+        except Exception as e:
+            err_msg = str(e)
+            is_rate_limit = "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg
+            is_permission = "403" in err_msg or "PERMISSION_DENIED" in err_msg
+
+            if is_permission:
+                # Private/unavailable video — give up immediately
+                print(f"[yt-gem] {video_url}: 403 (skipping)")
+                return []
+
+            if is_rate_limit and attempt < max_retries:
+                # Try to parse retryDelay from message; fall back to exponential.
+                m = re.search(r"retry in ([\d.]+)s", err_msg)
+                wait = float(m.group(1)) if m else (15 * (attempt + 1))
+                wait += 5  # safety margin since the limit is per-minute
+                print(f"[yt-gem] 429 on {video_url} — sleeping {wait:.1f}s then retrying")
+                time.sleep(wait)
+                continue
+
+            print(f"[yt-gem] gemini call failed for {video_url}: {type(e).__name__}: {err_msg[:200]}")
+            return []
+    return []
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -184,7 +210,8 @@ def scrape(lookback_days: int = DEFAULT_LOOKBACK_DAYS) -> list[dict]:
         videos = _list_recent_videos(youtube, ch_id, after)
         # newest first
         videos.sort(key=lambda v: v["publishedAt"], reverse=True)
-        print(f"[yt-gem] {channel['name']}: {len(videos)} videos in last {lookback_days}d")
+        videos = videos[:MAX_VIDEOS_PER_CHANNEL]
+        print(f"[yt-gem] {channel['name']}: processing {len(videos)} most-recent videos in last {lookback_days}d")
 
         # Per-channel dedupe: weapon_name → first build seen (newest wins because list is sorted)
         seen: dict[str, dict] = {}
@@ -192,7 +219,7 @@ def scrape(lookback_days: int = DEFAULT_LOOKBACK_DAYS) -> list[dict]:
         for v in videos:
             url = f"https://youtube.com/watch?v={v['videoId']}"
             builds = _gemini_extract(url, gemini)
-            time.sleep(0.5)  # gentle rate limit
+            time.sleep(SLEEP_BETWEEN_CALLS_S)
 
             for b in builds:
                 wname = (b.get("weapon_name") or "").strip()

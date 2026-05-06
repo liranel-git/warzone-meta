@@ -102,6 +102,11 @@ def upsert_build(build: dict):
             "play_style": play_style,
             "weapon_dominancy": build.get("weapon_dominancy"),
             "published_at": build.get("published_at"),
+            "upvotes": build.get("upvotes", 0),
+            "confidence": build.get("confidence", 0.7),
+            "reasoning": build.get("reasoning"),
+            "source_url": build.get("source_url"),
+            "source_title": build.get("source_title"),
             "attachments": json.dumps(build["attachments"]),
         })
 
