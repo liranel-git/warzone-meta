@@ -218,19 +218,23 @@ def _gemini_extract(video_url: str, duration_s: int, client, max_retries: int = 
         except Exception as e:
             err_msg = str(e)
             is_rate_limit = "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg
+            is_overloaded = "503" in err_msg or "UNAVAILABLE" in err_msg
             is_permission = "403" in err_msg or "PERMISSION_DENIED" in err_msg
 
             if is_permission:
-                # Private/unavailable video — give up immediately
                 print(f"[yt-gem] {video_url}: 403 (skipping)")
                 return []
 
-            if is_rate_limit and attempt < max_retries:
-                # Try to parse retryDelay from message; fall back to exponential.
+            if (is_rate_limit or is_overloaded) and attempt < max_retries:
+                # Parse retryDelay if Gemini provided one; otherwise exp backoff.
                 m = re.search(r"retry in ([\d.]+)s", err_msg)
                 wait = float(m.group(1)) if m else (15 * (attempt + 1))
-                wait += 5  # safety margin since the limit is per-minute
-                print(f"[yt-gem] 429 on {video_url} — sleeping {wait:.1f}s then retrying")
+                if is_overloaded:
+                    # Server overload — wait a bit longer.
+                    wait = max(wait, 30 * (attempt + 1))
+                wait += 5
+                code = "429" if is_rate_limit else "503"
+                print(f"[yt-gem] {code} on {video_url} — sleeping {wait:.1f}s then retrying")
                 time.sleep(wait)
                 continue
 
