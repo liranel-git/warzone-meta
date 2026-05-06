@@ -7,14 +7,17 @@ export default function AdminPage() {
   const navigate = useNavigate();
   const [password, setPassword] = useState("");
   const [status, setStatus] = useState(null); // null | "running" | "success" | "error"
+  const [lastMode, setLastMode] = useState(null);
   const [errorMsg, setErrorMsg] = useState("");
 
-  async function handleRefresh() {
+  async function trigger(mode) {
     if (!password) return;
     setStatus("running");
+    setLastMode(mode);
     setErrorMsg("");
+    const path = mode === "weekly" ? "/api/pipeline/run-weekly" : "/api/pipeline/run-daily";
     try {
-      const res = await fetch(`${API}/api/pipeline/run`, {
+      const res = await fetch(`${API}${path}`, {
         method: "POST",
         headers: { "x-pipeline-secret": password },
       });
@@ -30,13 +33,15 @@ export default function AdminPage() {
     }
   }
 
+  const disabled = status === "running" || !password;
+
   return (
     <div style={styles.page}>
       <div style={styles.card}>
         <button style={styles.back} onClick={() => navigate("/")}>← Back</button>
         <h2 style={styles.title}>Admin Panel</h2>
         <p style={styles.desc}>
-          Trigger the scraper pipeline to pull the latest YouTube videos and re-classify weapon builds.
+          Trigger the scraper pipeline manually. Weekly pulls 7 days of videos; Daily only the current day.
         </p>
 
         <label style={styles.label}>Admin password</label>
@@ -46,24 +51,33 @@ export default function AdminPage() {
           placeholder="Enter password…"
           value={password}
           onChange={(e) => setPassword(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && handleRefresh()}
           disabled={status === "running"}
         />
 
-        <button
-          style={{
-            ...styles.btn,
-            opacity: status === "running" || !password ? 0.6 : 1,
-          }}
-          onClick={handleRefresh}
-          disabled={status === "running" || !password}
-        >
-          {status === "running" ? "Pipeline running…" : "↻ Refresh Data"}
-        </button>
+        <div style={styles.btnRow}>
+          <button
+            style={{ ...styles.btn, ...styles.btnWeekly, opacity: disabled ? 0.6 : 1 }}
+            onClick={() => trigger("weekly")}
+            disabled={disabled}
+          >
+            {status === "running" && lastMode === "weekly"
+              ? "Running weekly…"
+              : "🗓 Weekly Refresh (7 days)"}
+          </button>
+          <button
+            style={{ ...styles.btn, ...styles.btnDaily, opacity: disabled ? 0.6 : 1 }}
+            onClick={() => trigger("daily")}
+            disabled={disabled}
+          >
+            {status === "running" && lastMode === "daily"
+              ? "Running daily…"
+              : "↻ Daily Refresh (today)"}
+          </button>
+        </div>
 
         {status === "success" && (
           <p style={styles.success}>
-            Pipeline started. Data will update in ~60 seconds.{" "}
+            {lastMode === "weekly" ? "Weekly" : "Daily"} pipeline started. Data updates in ~1–3 minutes.{" "}
             <span style={styles.link} onClick={() => navigate("/")}>Go back →</span>
           </p>
         )}
@@ -88,7 +102,7 @@ const styles = {
     borderRadius: 16,
     padding: "40px 48px",
     width: "100%",
-    maxWidth: 420,
+    maxWidth: 460,
     display: "flex",
     flexDirection: "column",
     gap: 16,
@@ -133,17 +147,19 @@ const styles = {
     width: "100%",
     boxSizing: "border-box",
   },
+  btnRow: { display: "flex", flexDirection: "column", gap: 10 },
   btn: {
-    background: "#3a3a8a",
     border: "none",
     color: "#fff",
     borderRadius: 10,
     padding: "12px 0",
-    fontSize: 15,
+    fontSize: 14,
     fontWeight: 700,
     cursor: "pointer",
     letterSpacing: "0.04em",
   },
+  btnWeekly: { background: "#3a3a8a" },
+  btnDaily: { background: "#2a5a8a" },
   success: {
     fontSize: 13,
     color: "#6bffb8",

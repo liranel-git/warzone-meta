@@ -358,11 +358,15 @@ def scrape() -> list[dict]:
 
     result = []
     for b in WARZONE_BUILDS:
+        # In the new schema, play_style identifies the source ("WZ Hub")
+        # and weapon_dominancy holds the old style label (Long Range, etc.)
         result.append({
             **b,
+            "play_style": "WZ Hub",
+            "weapon_dominancy": b.get("play_style"),
             "title": f"{b['weapon_name']} {b['tier']} build",
             "text": (f"Weapon: {b['weapon_name']}\nClass: {b['weapon_class']}\n"
-                     f"Tier: {b['tier']}\nPlay style: {b['play_style']}\n"
+                     f"Tier: {b['tier']}\nDominancy: {b.get('play_style')}\n"
                      f"Attachments: {', '.join(b['attachments'])}\n"
                      f"Reasoning: {b['reasoning']}"),
             "source_type": "website",

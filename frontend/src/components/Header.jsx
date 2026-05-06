@@ -18,7 +18,7 @@ export default function Header({ stats }) {
           <span style={styles.logo}>⚔</span>
           <div>
             <h1 style={styles.title}>WARZONE META</h1>
-            <p style={styles.subtitle}>Community-ranked weapon builds · powered by AI</p>
+            <p style={styles.subtitle}>Community-ranked weapon builds</p>
           </div>
         </div>
 

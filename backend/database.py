@@ -1,7 +1,6 @@
 import sqlite3
 import json
 import os
-from datetime import datetime
 
 _data_dir = os.environ.get("DB_DIR", os.path.dirname(__file__))
 DB_PATH = os.path.join(_data_dir, "warzone.db")
@@ -22,6 +21,7 @@ def init_db():
                 weapon_class TEXT NOT NULL,
                 game TEXT NOT NULL DEFAULT 'Warzone',
                 play_style TEXT,
+                weapon_dominancy TEXT,
                 tier TEXT NOT NULL,
                 attachments TEXT NOT NULL,
                 source_type TEXT NOT NULL,
@@ -30,6 +30,7 @@ def init_db():
                 confidence REAL DEFAULT 0.8,
                 reasoning TEXT,
                 upvotes INTEGER DEFAULT 0,
+                published_at TEXT,
                 created_at TEXT DEFAULT (datetime('now')),
                 updated_at TEXT DEFAULT (datetime('now'))
             )
@@ -38,16 +39,21 @@ def init_db():
         for col, definition in [
             ("game", "TEXT NOT NULL DEFAULT 'Warzone'"),
             ("play_style", "TEXT"),
+            ("weapon_dominancy", "TEXT"),
+            ("published_at", "TEXT"),
         ]:
             try:
                 conn.execute(f"ALTER TABLE builds ADD COLUMN {col} {definition}")
             except Exception:
-                pass  # already exists
-        # Replace old unique index (weapon_name, weapon_class) with one that includes game
+                pass
+
+        # Drop old indexes; new uniqueness is per (weapon, class, game, play_style)
+        # so different creators/sources can each have their own build for the same weapon.
         conn.execute("DROP INDEX IF EXISTS idx_weapon")
+        conn.execute("DROP INDEX IF EXISTS idx_weapon_game")
         conn.execute("""
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_weapon_game
-            ON builds(weapon_name, weapon_class, game)
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_weapon_source
+            ON builds(weapon_name, weapon_class, game, play_style)
         """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS scrape_log (
@@ -62,37 +68,46 @@ def init_db():
 
 def upsert_build(build: dict):
     game = build.get("game", "Warzone")
+    play_style = build.get("play_style") or "Unknown"
     with get_conn() as conn:
         conn.execute("""
             INSERT INTO builds
-                (weapon_name, weapon_class, game, play_style, tier, attachments,
-                 source_type, source_url, source_title, confidence, reasoning, upvotes, updated_at)
+                (weapon_name, weapon_class, game, play_style, weapon_dominancy, tier, attachments,
+                 source_type, source_url, source_title, confidence, reasoning, upvotes,
+                 published_at, updated_at)
             VALUES
-                (:weapon_name, :weapon_class, :game, :play_style, :tier, :attachments,
+                (:weapon_name, :weapon_class, :game, :play_style, :weapon_dominancy, :tier, :attachments,
                  :source_type, :source_url, :source_title, :confidence, :reasoning, :upvotes,
-                 datetime('now'))
-            ON CONFLICT(weapon_name, weapon_class, game) DO UPDATE SET
-                tier        = CASE WHEN excluded.confidence > builds.confidence
-                                   THEN excluded.tier        ELSE builds.tier        END,
-                attachments = CASE WHEN excluded.confidence > builds.confidence
-                                   THEN excluded.attachments ELSE builds.attachments END,
-                reasoning   = CASE WHEN excluded.confidence > builds.confidence
-                                   THEN excluded.reasoning   ELSE builds.reasoning   END,
-                play_style  = COALESCE(excluded.play_style, builds.play_style),
-                source_url   = excluded.source_url,
-                source_title = excluded.source_title,
-                confidence  = MAX(excluded.confidence, builds.confidence),
-                upvotes     = MAX(excluded.upvotes, builds.upvotes),
-                updated_at  = datetime('now')
+                 :published_at, datetime('now'))
+            ON CONFLICT(weapon_name, weapon_class, game, play_style) DO UPDATE SET
+                tier             = CASE WHEN excluded.published_at IS NOT NULL
+                                         AND (builds.published_at IS NULL OR excluded.published_at >= builds.published_at)
+                                        THEN excluded.tier ELSE builds.tier END,
+                attachments      = CASE WHEN excluded.published_at IS NOT NULL
+                                         AND (builds.published_at IS NULL OR excluded.published_at >= builds.published_at)
+                                        THEN excluded.attachments ELSE builds.attachments END,
+                reasoning        = CASE WHEN excluded.published_at IS NOT NULL
+                                         AND (builds.published_at IS NULL OR excluded.published_at >= builds.published_at)
+                                        THEN excluded.reasoning ELSE builds.reasoning END,
+                weapon_dominancy = COALESCE(excluded.weapon_dominancy, builds.weapon_dominancy),
+                source_url       = excluded.source_url,
+                source_title     = excluded.source_title,
+                confidence       = MAX(excluded.confidence, builds.confidence),
+                upvotes          = MAX(excluded.upvotes, builds.upvotes),
+                published_at     = COALESCE(excluded.published_at, builds.published_at),
+                updated_at       = datetime('now')
         """, {
             **build,
             "game": game,
-            "play_style": build.get("play_style"),
+            "play_style": play_style,
+            "weapon_dominancy": build.get("weapon_dominancy"),
+            "published_at": build.get("published_at"),
             "attachments": json.dumps(build["attachments"]),
         })
 
 
-def get_builds(tier=None, weapon_class=None, game=None, play_style=None) -> list[dict]:
+def get_builds(tier=None, weapon_class=None, game=None, play_style=None,
+               weapon_dominancy=None) -> list[dict]:
     sql = "SELECT * FROM builds WHERE 1=1"
     params = []
     if tier:
@@ -107,6 +122,12 @@ def get_builds(tier=None, weapon_class=None, game=None, play_style=None) -> list
     if play_style:
         sql += " AND play_style = ?"
         params.append(play_style)
+    if weapon_dominancy:
+        if isinstance(weapon_dominancy, str):
+            weapon_dominancy = [weapon_dominancy]
+        placeholders = ",".join("?" * len(weapon_dominancy))
+        sql += f" AND weapon_dominancy IN ({placeholders})"
+        params.extend(weapon_dominancy)
 
     tier_order = ("CASE tier WHEN 'Absolute Meta' THEN 1 WHEN 'Meta' THEN 2 "
                   "WHEN 'A' THEN 3 WHEN 'B' THEN 4 WHEN 'F' THEN 5 ELSE 6 END")
@@ -129,12 +150,16 @@ def get_stats() -> dict:
         by_tier = {}
         for row in conn.execute("SELECT tier, COUNT(*) as n FROM builds GROUP BY tier"):
             by_tier[row["tier"]] = row["n"]
+        by_play_style = {}
+        for row in conn.execute("SELECT play_style, COUNT(*) as n FROM builds GROUP BY play_style"):
+            by_play_style[row["play_style"] or "Unknown"] = row["n"]
         last_log = conn.execute(
             "SELECT ran_at FROM scrape_log ORDER BY id DESC LIMIT 1"
         ).fetchone()
     return {
         "total": total,
         "by_tier": by_tier,
+        "by_play_style": by_play_style,
         "last_scraped": last_log["ran_at"] if last_log else None,
     }
 

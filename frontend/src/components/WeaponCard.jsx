@@ -13,7 +13,7 @@ const CLASS_ICONS = {
   Shotgun: "💥", Marksman: "🏹", Pistol: "🔘",
 };
 
-const PLAY_STYLE_MAPS = {
+const DOMINANCY_MAPS = {
   "Long Range":     ["Verdansk", "Haven's Hollow"],
   "Sniper":         ["Verdansk"],
   "Support":        ["Verdansk", "Haven's Hollow"],
@@ -24,10 +24,10 @@ const PLAY_STYLE_MAPS = {
 };
 
 export default function WeaponCard({ build }) {
-  const [expanded, setExpanded] = useState(false);
   const [showMaps, setShowMaps] = useState(false);
   const t = TIER_COLORS[build.tier] ?? TIER_COLORS.B;
-  const bestMaps = PLAY_STYLE_MAPS[build.play_style] ?? null;
+  const dominancy = build.weapon_dominancy;
+  const bestMaps = dominancy ? DOMINANCY_MAPS[dominancy] : null;
 
   return (
     <div style={{ ...styles.card, borderColor: t.accent, background: `linear-gradient(135deg, ${t.bg}, #13131f)` }}>
@@ -40,6 +40,15 @@ export default function WeaponCard({ build }) {
           </span>
         </div>
         <span style={styles.classTag}>{build.weapon_class}</span>
+      </div>
+
+      <div style={styles.metaRow}>
+        {build.play_style && (
+          <span style={styles.playStyleTag}>📺 {build.play_style}</span>
+        )}
+        {dominancy && (
+          <span style={styles.dominancyTag}>{dominancy}</span>
+        )}
       </div>
 
       <div style={styles.attachments}>
@@ -58,35 +67,12 @@ export default function WeaponCard({ build }) {
               {bestMaps.map((m) => (
                 <span key={m} style={styles.mapChip}>🗺 {m}</span>
               ))}
-              {build.play_style && (
-                <span style={styles.styleNote}>{build.play_style} loadout</span>
-              )}
             </div>
           )}
         </div>
       )}
 
-      {build.reasoning && (
-        <div>
-          {expanded && (
-            <p style={styles.reasoning}>{build.reasoning}</p>
-          )}
-          <button style={styles.toggle} onClick={() => setExpanded(!expanded)}>
-            {expanded ? "Show less ▲" : "Show more ▼"}
-          </button>
-        </div>
-      )}
-
       <div style={styles.footer}>
-        <span style={styles.source}>
-          {build.source_type === "website" ? "🌐" : build.source_type === "youtube" ? "▶ YouTube" : "💬 Reddit"}
-          {build.source_title ? ` · ${build.source_title.slice(0, 48)}${build.source_title.length > 48 ? "…" : ""}` : ""}
-        </span>
-        {build.source_url && (
-          <a href={build.source_url} target="_blank" rel="noreferrer" style={styles.sourceLink}>
-            Source ↗
-          </a>
-        )}
         <span style={{ ...styles.confidence, color: build.confidence >= 0.85 ? "#00e676" : build.confidence >= 0.65 ? "#ffb74d" : "#ef5350" }}>
           {Math.round(build.confidence * 100)}% confidence
         </span>
@@ -102,7 +88,7 @@ const styles = {
     padding: "18px 20px",
     display: "flex",
     flexDirection: "column",
-    gap: 12,
+    gap: 10,
     transition: "transform 0.15s",
   },
   top: {
@@ -141,6 +127,16 @@ const styles = {
     padding: "2px 8px",
     flexShrink: 0,
   },
+  metaRow: { display: "flex", gap: 6, flexWrap: "wrap" },
+  playStyleTag: {
+    background: "#1a2236", border: "1px solid #2a3a55", color: "#9bb8e0",
+    borderRadius: 6, padding: "3px 10px", fontSize: 11,
+    fontWeight: 600, letterSpacing: "0.03em",
+  },
+  dominancyTag: {
+    background: "#1a1a2e", border: "1px solid #2a2a40", color: "#9090b0",
+    borderRadius: 6, padding: "3px 10px", fontSize: 11,
+  },
   attachments: {
     display: "flex",
     flexWrap: "wrap",
@@ -169,18 +165,6 @@ const styles = {
     fontSize: 12,
     color: "#4fc3f7",
   },
-  styleNote: {
-    fontSize: 11,
-    color: "#4a4a6a",
-    marginLeft: 4,
-  },
-  reasoning: {
-    fontSize: 13,
-    color: "#8080a0",
-    fontStyle: "italic",
-    lineHeight: 1.5,
-    margin: "0 0 6px 0",
-  },
   toggle: {
     background: "none",
     border: "none",
@@ -193,19 +177,10 @@ const styles = {
   footer: {
     display: "flex",
     alignItems: "center",
+    justifyContent: "flex-end",
     gap: 12,
     flexWrap: "wrap",
     marginTop: 4,
-  },
-  source: {
-    fontSize: 11,
-    color: "#555570",
-    flex: 1,
-  },
-  sourceLink: {
-    fontSize: 11,
-    color: "#4fc3f7",
-    textDecoration: "underline",
   },
   confidence: {
     fontSize: 11,

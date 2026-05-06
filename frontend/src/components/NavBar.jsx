@@ -1,10 +1,7 @@
 import { useNavigate, useLocation } from "react-router-dom";
 
 const NAV_ITEMS = [
-  { label: "WARZONE META", path: "/" },
-  { label: "META HUB", path: "/meta-hub" },
-  { label: "MAPS HUB", path: "/maps-hub" },
-  { label: "CAMO HUB", path: "/camo-hub" },
+  { label: "META BUILDS", path: "/" },
 ];
 
 export default function NavBar() {
