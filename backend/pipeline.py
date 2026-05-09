@@ -65,11 +65,22 @@ def _run_with_youtube_lookback(lookback_days: int, label: str):
         print(f"[pipeline] <<< {name}: {len(res)} builds ({elapsed:.1f}s)", flush=True)
         builds.extend(res)
 
-    if ENABLE_GEMINI_SITES:
-        # Codmunity runs FIRST so its weapon list is cached before
-        # youtube_gemini loads its whitelist.
+    # Site scrapers (codmunity + wzstats) use Gemini google_search grounding
+    # which is token-heavy (~50–100K each). On daily runs we skip them and
+    # rely on the cached codmunity whitelist from the last weekly run.
+    # On weekly runs we refresh both sites + wait 60s between heavy stages
+    # so the per-minute Gemini quota has time to recover before the next
+    # batch of grounded calls hits.
+    run_sites = ENABLE_GEMINI_SITES and label == "weekly"
+    if run_sites:
         step("codmunity", scrape_codmunity, hard_timeout_s=120)
+        time.sleep(30)
         step("wzstats", scrape_wzstats, hard_timeout_s=120)
+        # Cooldown so YT text calls (also grounded) don't immediately 429.
+        print("[pipeline] cooling down 60s before youtube_gemini …", flush=True)
+        time.sleep(60)
+    elif ENABLE_GEMINI_SITES:
+        print(f"[pipeline] codmunity + wzstats SKIPPED (only run on weekly; this is {label})", flush=True)
     else:
         print("[pipeline] codmunity + wzstats SKIPPED (ENABLE_GEMINI_SITES=0)", flush=True)
 
