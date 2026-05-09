@@ -22,8 +22,21 @@ load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
 from database import init_db, upsert_build, log_scrape, delete_builds_by_play_style
 from scrapers.wzhub import scrape as scrape_wzhub
-from scrapers.youtube_gemini import scrape as scrape_youtube_gemini
+from scrapers.youtube_gemini import scrape as scrape_youtube_gemini, CHANNELS as YT_CHANNELS
 from scrapers.gemini_site import scrape_codmunity, scrape_wzstats
+
+# Codmunity + WZ Stats URL-context calls were eating tokens (their homepage
+# HTML counts as input tokens via the url_context tool) without returning
+# data. Gated off by default; flip ENABLE_GEMINI_SITES=1 once we find URLs
+# Gemini can actually parse.
+ENABLE_GEMINI_SITES = os.environ.get("ENABLE_GEMINI_SITES", "0") == "1"
+
+# All play-style buckets we manage. Wiped before every run so stale rows
+# (hallucinated weapons from pre-whitelist runs, channels that went silent,
+# etc.) don't linger in the UI.
+KNOWN_PLAY_STYLES: list[str] = ["WZ Hub", "Codmunity", "WZ Meta"] + [
+    ch["play_style"] for ch in YT_CHANNELS
+]
 
 
 def _run_with_youtube_lookback(lookback_days: int, label: str):
@@ -53,10 +66,14 @@ def _run_with_youtube_lookback(lookback_days: int, label: str):
         print(f"[pipeline] <<< {name}: {len(res)} builds ({elapsed:.1f}s)", flush=True)
         builds.extend(res)
 
-    # Order matters: codmunity runs FIRST so its weapon list is cached
-    # before youtube_gemini loads its whitelist.
-    step("codmunity", scrape_codmunity, hard_timeout_s=120)
-    step("wzstats", scrape_wzstats, hard_timeout_s=120)
+    if ENABLE_GEMINI_SITES:
+        # Codmunity runs FIRST so its weapon list is cached before
+        # youtube_gemini loads its whitelist.
+        step("codmunity", scrape_codmunity, hard_timeout_s=120)
+        step("wzstats", scrape_wzstats, hard_timeout_s=120)
+    else:
+        print("[pipeline] codmunity + wzstats SKIPPED (ENABLE_GEMINI_SITES=0)", flush=True)
+
     step("wzhub", scrape_wzhub, hard_timeout_s=30)
     step(
         "youtube_gemini",
@@ -64,21 +81,25 @@ def _run_with_youtube_lookback(lookback_days: int, label: str):
         hard_timeout_s=60 * 30,
     )
 
+    # ALWAYS wipe every known play-style bucket — even ones where we
+    # didn't extract anything this run. Otherwise stale rows from older
+    # runs (hallucinated weapons before the whitelist, channels that went
+    # silent for a few days) hang around in the UI forever.
+    deleted_total = delete_builds_by_play_style(KNOWN_PLAY_STYLES)
+    print(f"[pipeline] wiped {deleted_total} rows across {len(KNOWN_PLAY_STYLES)} known play_styles", flush=True)
+
     if not builds:
-        print(f"[pipeline] {label}: nothing to upsert")
+        print(f"[pipeline] {label}: nothing to upsert (all buckets now empty)")
+        log_scrape(label, 0, 0)
         return 0
 
-    # Group by play_style and wipe-then-insert per bucket so stale rows
-    # (from before the whitelist was active, or from a previous run that
-    # used a different build for the same weapon) don't linger.
     by_style: dict[str, list[dict]] = defaultdict(list)
     for b in builds:
         by_style[b.get("play_style") or "Unknown"].append(b)
 
     upserted = 0
     for play_style, style_builds in by_style.items():
-        deleted = delete_builds_by_play_style([play_style])
-        print(f"[pipeline] {play_style}: wiped {deleted} stale → upserting {len(style_builds)}", flush=True)
+        print(f"[pipeline] {play_style}: upserting {len(style_builds)}", flush=True)
         for b in style_builds:
             try:
                 upsert_build(b)
