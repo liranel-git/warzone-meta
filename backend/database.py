@@ -169,6 +169,21 @@ def get_stats() -> dict:
     }
 
 
+def delete_builds_by_play_style(play_styles: list[str], game: str = "Warzone") -> int:
+    """Wipe rows for the given play_style buckets. Used before re-inserting
+    fresh data so stale builds (e.g. from a previous run before the whitelist
+    was active) don't linger."""
+    if not play_styles:
+        return 0
+    placeholders = ",".join("?" * len(play_styles))
+    with get_conn() as conn:
+        cur = conn.execute(
+            f"DELETE FROM builds WHERE game = ? AND play_style IN ({placeholders})",
+            [game, *play_styles],
+        )
+        return cur.rowcount or 0
+
+
 def log_scrape(source: str, items_scraped: int, builds_added: int):
     with get_conn() as conn:
         conn.execute(

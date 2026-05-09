@@ -84,10 +84,51 @@ def _normalize_for_match(s: str) -> str:
     return re.sub(r"[\s\-_.]+", "", s.lower())
 
 
+def _whitelist_path() -> str:
+    data_dir = os.environ.get("DB_DIR")
+    if not data_dir:
+        data_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(data_dir, "codmunity_whitelist.json")
+
+
+def _load_codmunity_whitelist() -> tuple[dict[str, str], dict[str, str]] | None:
+    """Returns (valid, classes) if codmunity cache is available, else None."""
+    path = _whitelist_path()
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"[yt-gem] codmunity whitelist load failed: {e}")
+        return None
+    cm_weapons = data.get("weapons", {})
+    if not cm_weapons:
+        return None
+    valid: dict[str, str] = {}
+    classes: dict[str, str] = {}
+    for name, cls in cm_weapons.items():
+        valid[name.lower()] = name
+        valid[_normalize_for_match(name)] = name
+        classes[name] = cls or "AR"
+    return valid, classes
+
+
 def _ensure_weapon_cache() -> None:
     global _VALID_WEAPONS_CACHE, _WEAPON_TO_CLASS_CACHE
     if _VALID_WEAPONS_CACHE is not None:
         return
+
+    # 1. Primary: codmunity whitelist (written by gemini_site.scrape_codmunity)
+    cm = _load_codmunity_whitelist()
+    if cm is not None:
+        _VALID_WEAPONS_CACHE, _WEAPON_TO_CLASS_CACHE = cm
+        n = len(_WEAPON_TO_CLASS_CACHE)
+        print(f"[yt-gem] using codmunity whitelist ({n} weapons)")
+        return
+
+    # 2. Fallback: wzhub canonical list (only used until codmunity cache exists)
+    print("[yt-gem] codmunity whitelist unavailable, falling back to wzhub")
     valid: dict[str, str] = {}
     classes: dict[str, str] = {}
     try:
@@ -96,7 +137,7 @@ def _ensure_weapon_cache() -> None:
         try:
             from .wzhub import WARZONE_BUILDS  # type: ignore
         except Exception:
-            print("[yt-gem] could not import wzhub.WARZONE_BUILDS — whitelist empty!")
+            print("[yt-gem] wzhub unavailable too — whitelist empty!")
             _VALID_WEAPONS_CACHE = valid
             _WEAPON_TO_CLASS_CACHE = classes
             return
@@ -433,9 +474,43 @@ def _looks_like_build_video(title: str) -> bool:
     return any(k in t for k in BUILD_TITLE_KEYWORDS)
 
 
+def _enrich_attachments(text_builds: list[dict], video_url: str,
+                        duration_s: int, client) -> list[dict]:
+    """If text-extracted builds have empty attachments, run a visual call to
+    fill them in. Visual extraction can read attachment slot/name pairs off
+    the loadout screen even when the creator doesn't say them verbally."""
+    needs = [b for b in text_builds if not (b.get("attachments") or [])]
+    if not needs or duration_s <= 0:
+        return text_builds
+
+    print(f"[yt-gem]   enriching {len(needs)} build(s) with empty attachments via visual")
+    time.sleep(2)
+    visual_raw = _gemini_visual_call(video_url, duration_s, client)
+    if not visual_raw:
+        return text_builds
+
+    # Map normalized weapon name → attachments seen in visual
+    by_weapon: dict[str, list[str]] = {}
+    for vb in visual_raw:
+        name = _normalize_weapon_name(vb.get("weapon_name", ""))
+        atts = vb.get("attachments") or []
+        if name and atts:
+            by_weapon[name] = atts
+
+    for b in text_builds:
+        if b.get("attachments"):
+            continue
+        canonical = _normalize_weapon_name(b.get("weapon_name", ""))
+        if canonical and canonical in by_weapon:
+            b["attachments"] = by_weapon[canonical]
+
+    return text_builds
+
+
 def _extract_for_video(video_url: str, video_id: str, title: str,
                        meta: dict, client) -> tuple[list[dict], str]:
-    """Try text first; visual fallback if text empty AND title suggests builds."""
+    """Try text first. Enrich missing attachments visually. Fall back to
+    visual-only when text returned nothing AND title suggests builds."""
     description = meta.get("description", "") if meta else ""
     duration_s = meta.get("duration_s", 0) if meta else 0
     transcript = _fetch_transcript(video_id)
@@ -443,7 +518,8 @@ def _extract_for_video(video_url: str, video_id: str, title: str,
     prompt = _build_text_prompt(title, description, transcript)
     raw = _gemini_text_call(prompt, client)
     if raw:
-        return raw, "text"
+        raw = _enrich_attachments(raw, video_url, duration_s, client)
+        return raw, "text+enrich" if any(b.get("attachments") for b in raw) else "text"
 
     if _looks_like_build_video(title):
         time.sleep(2)

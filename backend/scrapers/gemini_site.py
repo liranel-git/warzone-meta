@@ -3,6 +3,9 @@ Generic website scraper that uses Gemini's URL-context tool to fetch a
 JS-rendered meta page and extract structured weapon builds. Used for
 codmunity.gg, wzstats.gg, etc. — sites that don't return useful HTML
 via plain HTTP.
+
+Codmunity output is also persisted to a JSON cache file so the YouTube
+extractor can use it as the canonical weapon whitelist.
 """
 
 import json
@@ -10,6 +13,32 @@ import os
 import re
 
 GEMINI_MODEL = "gemini-2.5-flash"
+
+
+def _whitelist_path() -> str:
+    data_dir = os.environ.get("DB_DIR")
+    if not data_dir:
+        data_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(data_dir, "codmunity_whitelist.json")
+
+
+def _save_codmunity_whitelist(builds: list[dict]) -> None:
+    weapons: dict[str, str] = {}
+    for b in builds:
+        name = (b.get("weapon_name") or "").strip()
+        cls = (b.get("weapon_class") or "").strip()
+        if name:
+            weapons[name] = cls or "AR"
+    if not weapons:
+        return
+    path = _whitelist_path()
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"weapons": weapons}, f, indent=2)
+        print(f"[gem-site] saved codmunity whitelist: {len(weapons)} weapons → {path}")
+    except Exception as e:
+        print(f"[gem-site] failed to save whitelist: {e}")
 
 PROMPT = """Visit the URL provided and extract every weapon build the page presents as part of the current Warzone meta tier list.
 
@@ -120,16 +149,19 @@ def scrape_site(url: str, play_style: str, source_title: str) -> list[dict]:
 # ──────────────────────────────────────────────────────────────────────────
 
 def scrape_codmunity() -> list[dict]:
-    return scrape_site(
-        "https://codmunity.gg/loadouts",
+    builds = scrape_site(
+        "https://codmunity.gg/meta",
         play_style="Codmunity",
         source_title="codmunity.gg",
     )
+    if builds:
+        _save_codmunity_whitelist(builds)
+    return builds
 
 
 def scrape_wzstats() -> list[dict]:
     return scrape_site(
-        "https://wzstats.gg/warzone/meta",
+        "https://wzstats.gg/",
         play_style="WZ Meta",
         source_title="wzstats.gg",
     )
