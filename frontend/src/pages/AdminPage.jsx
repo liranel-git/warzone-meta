@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 
 const API = import.meta.env.VITE_API_URL ?? "";
@@ -9,6 +9,27 @@ export default function AdminPage() {
   const [status, setStatus] = useState(null); // null | "running" | "success" | "error"
   const [lastMode, setLastMode] = useState(null);
   const [errorMsg, setErrorMsg] = useState("");
+  const [serverRunning, setServerRunning] = useState(false);
+  const [serverMode, setServerMode] = useState(null);
+
+  // Poll /api/stats every 5s so we see when the backend pipeline finishes
+  // (or starts via a different client / the cron scheduler).
+  useEffect(() => {
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const r = await fetch(`${API}/api/stats`);
+        if (!r.ok) return;
+        const d = await r.json();
+        if (cancelled) return;
+        setServerRunning(!!d.pipeline_running);
+        setServerMode(d.pipeline_mode);
+      } catch {/* ignore */}
+    };
+    tick();
+    const id = setInterval(tick, 5000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, []);
 
   async function trigger(mode) {
     if (!password) return;
@@ -26,6 +47,17 @@ export default function AdminPage() {
         setStatus("error");
         return;
       }
+      if (res.status === 409) {
+        const j = await res.json().catch(() => ({}));
+        setErrorMsg(j.detail || "A pipeline is already running.");
+        setStatus("error");
+        return;
+      }
+      if (!res.ok) {
+        setErrorMsg(`Server returned ${res.status}.`);
+        setStatus("error");
+        return;
+      }
       setStatus("success");
     } catch {
       setErrorMsg("Could not reach the server.");
@@ -33,7 +65,7 @@ export default function AdminPage() {
     }
   }
 
-  const disabled = status === "running" || !password;
+  const disabled = status === "running" || serverRunning || !password;
 
   return (
     <div style={styles.page}>
@@ -54,13 +86,19 @@ export default function AdminPage() {
           disabled={status === "running"}
         />
 
+        {serverRunning && (
+          <div style={styles.runningBanner}>
+            ⏳ A {serverMode || "pipeline"} run is already in progress on the server. Buttons disabled until it finishes.
+          </div>
+        )}
+
         <div style={styles.btnRow}>
           <button
             style={{ ...styles.btn, ...styles.btnWeekly, opacity: disabled ? 0.6 : 1 }}
             onClick={() => trigger("weekly")}
             disabled={disabled}
           >
-            {status === "running" && lastMode === "weekly"
+            {(status === "running" && lastMode === "weekly") || (serverRunning && serverMode === "weekly")
               ? "Running weekly…"
               : "🗓 Weekly Refresh (7 days)"}
           </button>
@@ -69,7 +107,7 @@ export default function AdminPage() {
             onClick={() => trigger("daily")}
             disabled={disabled}
           >
-            {status === "running" && lastMode === "daily"
+            {(status === "running" && lastMode === "daily") || (serverRunning && serverMode === "daily")
               ? "Running daily…"
               : "↻ Daily Refresh (today)"}
           </button>
@@ -146,6 +184,11 @@ const styles = {
     outline: "none",
     width: "100%",
     boxSizing: "border-box",
+  },
+  runningBanner: {
+    background: "#1a1200", border: "1px solid #5a4000",
+    color: "#ffb74d", borderRadius: 8, padding: "10px 14px",
+    fontSize: 13, lineHeight: 1.5,
   },
   btnRow: { display: "flex", flexDirection: "column", gap: 10 },
   btn: {

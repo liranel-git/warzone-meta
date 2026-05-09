@@ -41,14 +41,38 @@ WEAPON_DOMINANCIES = ["Long Range", "Close Range", "Sniper", "Support",
                       "Hip Fire", "Aggressive", "Lowest Recoil"]
 
 
+_PIPELINE_LOCK = threading.Lock()
+_PIPELINE_STATE = {"running": False, "mode": None, "started_at": None}
+
+
+def _run_with_lock(mode_label: str, fn):
+    """Acquire the singleton lock and execute fn. If something is already
+    running we just bail — the caller has already returned 200 to the
+    client, but the worker won't double-fire."""
+    import time
+    if not _PIPELINE_LOCK.acquire(blocking=False):
+        print(f"[api] {mode_label} requested but pipeline already running — skipping", flush=True)
+        return
+    _PIPELINE_STATE["running"] = True
+    _PIPELINE_STATE["mode"] = mode_label
+    _PIPELINE_STATE["started_at"] = time.time()
+    try:
+        fn()
+    finally:
+        _PIPELINE_STATE["running"] = False
+        _PIPELINE_STATE["mode"] = None
+        _PIPELINE_STATE["started_at"] = None
+        _PIPELINE_LOCK.release()
+
+
 def _run_weekly():
     from pipeline import run_weekly
-    run_weekly()
+    _run_with_lock("weekly", run_weekly)
 
 
 def _run_daily():
     from pipeline import run_daily
-    run_daily()
+    _run_with_lock("daily", run_daily)
 
 
 @app.on_event("startup")
@@ -116,9 +140,10 @@ def stats():
     daily = scheduler.get_job("daily_pipeline")
     s["next_weekly"] = str(weekly.next_run_time) if weekly else None
     s["next_daily"] = str(daily.next_run_time) if daily else None
-    # Backward compat: surface the soonest run as "next_scrape"
     candidates = [j.next_run_time for j in (weekly, daily) if j and j.next_run_time]
     s["next_scrape"] = str(min(candidates)) if candidates else None
+    s["pipeline_running"] = _PIPELINE_STATE["running"]
+    s["pipeline_mode"] = _PIPELINE_STATE["mode"]
     return s
 
 
@@ -128,9 +153,18 @@ def _check_secret(provided: str | None):
         raise HTTPException(401, "Invalid secret")
 
 
+def _refuse_if_running():
+    if _PIPELINE_STATE["running"]:
+        raise HTTPException(
+            409,
+            f"A {_PIPELINE_STATE['mode']} pipeline is already running. Wait for it to finish.",
+        )
+
+
 @app.post("/api/pipeline/run-weekly")
 def trigger_weekly(x_pipeline_secret: str | None = Header(None)):
     _check_secret(x_pipeline_secret)
+    _refuse_if_running()
     threading.Thread(target=_run_weekly, daemon=True).start()
     return {"message": "Weekly pipeline started (7-day lookback)"}
 
@@ -138,6 +172,7 @@ def trigger_weekly(x_pipeline_secret: str | None = Header(None)):
 @app.post("/api/pipeline/run-daily")
 def trigger_daily(x_pipeline_secret: str | None = Header(None)):
     _check_secret(x_pipeline_secret)
+    _refuse_if_running()
     threading.Thread(target=_run_daily, daemon=True).start()
     return {"message": "Daily pipeline started (today only)"}
 
@@ -146,5 +181,6 @@ def trigger_daily(x_pipeline_secret: str | None = Header(None)):
 @app.post("/api/pipeline/run")
 def trigger_legacy(x_pipeline_secret: str | None = Header(None)):
     _check_secret(x_pipeline_secret)
+    _refuse_if_running()
     threading.Thread(target=_run_weekly, daemon=True).start()
     return {"message": "Pipeline started (weekly mode)"}
