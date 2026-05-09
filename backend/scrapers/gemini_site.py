@@ -1,8 +1,11 @@
 """
-Generic website scraper that uses Gemini's URL-context tool to fetch a
-JS-rendered meta page and extract structured weapon builds. Used for
-codmunity.gg, wzstats.gg, etc. — sites that don't return useful HTML
-via plain HTTP.
+Site scrapers using Gemini's GOOGLE-SEARCH grounding tool.
+
+The earlier url_context approach failed for codmunity.gg / wzstats.gg
+because both are JS-rendered — Gemini fetched the HTML but couldn't
+parse the live tier list. The Google Search grounding tool sidesteps
+that: Gemini queries Google, finds the indexed content, and synthesises
+a structured answer. Verified manually in Google AI Studio.
 
 Codmunity output is also persisted to a JSON cache file so the YouTube
 extractor can use it as the canonical weapon whitelist.
@@ -14,6 +17,10 @@ import re
 
 GEMINI_MODEL = "gemini-2.5-flash"
 
+
+# ──────────────────────────────────────────────────────────────────────────
+# Whitelist cache (codmunity weapons → JSON file for youtube_gemini)
+# ──────────────────────────────────────────────────────────────────────────
 
 def _whitelist_path() -> str:
     data_dir = os.environ.get("DB_DIR")
@@ -40,19 +47,10 @@ def _save_codmunity_whitelist(builds: list[dict]) -> None:
     except Exception as e:
         print(f"[gem-site] failed to save whitelist: {e}")
 
-PROMPT = """Visit the URL provided and extract every weapon build the page presents as part of the current Warzone meta tier list.
 
-Return strict JSON: {"builds": [...]}. Each build object must have:
-- weapon_name (string)
-- weapon_class (one of: AR, SMG, LMG, Sniper, Shotgun, Marksman, Pistol)
-- tier (one of: "Absolute Meta", "Meta", "A", "B", "F" — match the website's tier label as closely as possible: S/Meta → "Absolute Meta", A → "Meta", B → "A", C/D → "B", F → "F")
-- weapon_dominancy (string: Long Range, Close Range, Sniper, Support, Hip Fire, Aggressive, or Lowest Recoil)
-- attachments (array of "<Slot>: <Name>" strings — at minimum: Optic / Muzzle / Barrel / Magazine / Stock when shown)
-- confidence (float 0.5-0.95 reflecting how clearly the build is presented)
-- reasoning (one short sentence)
-
-If the page does not show explicit builds, return {"builds": []}. URL: """
-
+# ──────────────────────────────────────────────────────────────────────────
+# JSON extraction
+# ──────────────────────────────────────────────────────────────────────────
 
 def _extract_json(text: str) -> dict:
     text = re.sub(r"^```(?:json)?\s*", "", (text or "").strip())
@@ -66,44 +64,73 @@ def _extract_json(text: str) -> dict:
         return {"builds": []}
 
 
-def scrape_site(url: str, play_style: str, source_title: str) -> list[dict]:
+def _build_search_prompt(site_label: str, site_domain: str) -> str:
+    return f"""You are looking up the current Call of Duty: Warzone meta tier list on {site_label} ({site_domain}).
+
+Today is May 2026 — Warzone is in the BO7 (Black Ops 7) era, Season 3.
+
+Search Google for "{site_domain} Warzone meta tier list" or similar to find {site_label}'s current weapon rankings. From their published tier list, extract every weapon along with the recommended attachments {site_label} shows.
+
+Return strict JSON: {{"builds": [...]}}. Each build object must have:
+- weapon_name (string, exact in-game name as used in Warzone, e.g. "MK.78", "Voyak KT-3", "VST", "Strider 300")
+- weapon_class (one of: AR, SMG, LMG, Sniper, Shotgun, Marksman, Pistol)
+- tier (one of: "Absolute Meta", "Meta", "A", "B", "F").
+    Map the site's labels: S / Tier 1 / Meta → "Absolute Meta",
+    A / Tier 2 → "Meta", B / Tier 3 → "A", C / D → "B", F → "F".
+- weapon_dominancy (one of: Long Range, Close Range, Sniper, Support, Hip Fire, Aggressive, Lowest Recoil)
+- attachments (array of "<Slot>: <Name>" strings — Optic, Muzzle, Barrel, Underbarrel, Magazine, Stock, Rear Grip, Laser, Fire Mods, Conversion Kit, Bolt, Comb, Stock Pad, Ammunition, Trigger Action). Include 4–6 attachments per build when {site_label} lists them.
+- confidence (float 0.5-0.95 reflecting how clearly the build is presented)
+- reasoning (one short sentence — why the build is recommended)
+
+Aim for at least 10 weapons covering Absolute Meta, Meta, and A tier. If the site only shows a partial list, return what you can find.
+
+Return ONLY: {{"builds": [...]}}. No prose, no explanation."""
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Generic scraper
+# ──────────────────────────────────────────────────────────────────────────
+
+def _scrape_via_search(site_label: str, site_domain: str, play_style: str,
+                       source_title: str, source_url: str) -> list[dict]:
     gem_key = os.environ.get("GEMINI_API_KEY")
     if not gem_key:
-        print(f"[gem-site] GEMINI_API_KEY not set, skipping {url}")
+        print(f"[gem-site] GEMINI_API_KEY not set, skipping {site_label}")
         return []
 
     try:
         from google import genai
         from google.genai import types
     except ImportError as e:
-        print(f"[gem-site] google-genai package missing ({e}), skipping {url}")
+        print(f"[gem-site] google-genai package missing ({e}), skipping {site_label}")
         return []
 
     try:
-        # 60-second per-request timeout so a hanging call can't kill the pipeline
         client = genai.Client(
             api_key=gem_key,
-            http_options=types.HttpOptions(timeout=60_000),
+            http_options=types.HttpOptions(timeout=90_000),
         )
     except Exception as e:
-        print(f"[gem-site] failed to construct client for {url}: {e}")
+        print(f"[gem-site] failed to construct client for {site_label}: {e}")
         return []
 
-    print(f"[gem-site] requesting {url} …")
+    prompt = _build_search_prompt(site_label, site_domain)
+    print(f"[gem-site] searching {site_label} via Google grounding …")
+
     try:
         resp = client.models.generate_content(
             model=GEMINI_MODEL,
-            contents=PROMPT + url,
+            contents=prompt,
             config=types.GenerateContentConfig(
-                tools=[types.Tool(url_context=types.UrlContext())],
+                tools=[types.Tool(google_search=types.GoogleSearch())],
             ),
         )
         text = (resp.text or "").strip()
         if not text:
-            print(f"[gem-site] empty response for {url}")
+            print(f"[gem-site] empty response for {site_label}")
             return []
     except Exception as e:
-        print(f"[gem-site] gemini call failed for {url}: {type(e).__name__}: {e}")
+        print(f"[gem-site] gemini call failed for {site_label}: {type(e).__name__}: {str(e)[:200]}")
         return []
 
     parsed = _extract_json(text)
@@ -132,7 +159,7 @@ def scrape_site(url: str, play_style: str, source_title: str) -> list[dict]:
             "confidence": float(b.get("confidence") or 0.7),
             "reasoning": b.get("reasoning") or "",
             "source_type": "website",
-            "source_url": url,
+            "source_url": source_url,
             "source_title": source_title,
             "published_at": None,
             "title": f"{wname} — {source_title}",
@@ -140,7 +167,8 @@ def scrape_site(url: str, play_style: str, source_title: str) -> list[dict]:
             "upvotes": 0,
         })
 
-    print(f"[gem-site] {source_title}: {len(out)} builds extracted")
+    names = ", ".join(b["weapon_name"] for b in out[:5])
+    print(f"[gem-site] {site_label}: {len(out)} builds extracted [{names}{'...' if len(out) > 5 else ''}]")
     return out
 
 
@@ -149,10 +177,12 @@ def scrape_site(url: str, play_style: str, source_title: str) -> list[dict]:
 # ──────────────────────────────────────────────────────────────────────────
 
 def scrape_codmunity() -> list[dict]:
-    builds = scrape_site(
-        "https://codmunity.gg/",
+    builds = _scrape_via_search(
+        site_label="CODMunity",
+        site_domain="codmunity.gg",
         play_style="Codmunity",
         source_title="codmunity.gg",
+        source_url="https://codmunity.gg/",
     )
     if builds:
         _save_codmunity_whitelist(builds)
@@ -160,8 +190,10 @@ def scrape_codmunity() -> list[dict]:
 
 
 def scrape_wzstats() -> list[dict]:
-    return scrape_site(
-        "https://wzstats.gg/",
+    return _scrape_via_search(
+        site_label="WZStats",
+        site_domain="wzstats.gg",
         play_style="WZ Meta",
         source_title="wzstats.gg",
+        source_url="https://wzstats.gg/",
     )

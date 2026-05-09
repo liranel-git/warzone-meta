@@ -25,11 +25,10 @@ from scrapers.wzhub import scrape as scrape_wzhub
 from scrapers.youtube_gemini import scrape as scrape_youtube_gemini, CHANNELS as YT_CHANNELS
 from scrapers.gemini_site import scrape_codmunity, scrape_wzstats
 
-# Codmunity + WZ Stats URL-context calls were eating tokens (their homepage
-# HTML counts as input tokens via the url_context tool) without returning
-# data. Gated off by default; flip ENABLE_GEMINI_SITES=1 once we find URLs
-# Gemini can actually parse.
-ENABLE_GEMINI_SITES = os.environ.get("ENABLE_GEMINI_SITES", "0") == "1"
+# Codmunity + WZ Stats now use Gemini's google_search grounding tool
+# (verified to return useful data in AI Studio, unlike the old
+# url_context approach). Default ON; set ENABLE_GEMINI_SITES=0 to skip.
+ENABLE_GEMINI_SITES = os.environ.get("ENABLE_GEMINI_SITES", "1") == "1"
 
 # All play-style buckets we manage. Wiped before every run so stale rows
 # (hallucinated weapons from pre-whitelist runs, channels that went silent,
