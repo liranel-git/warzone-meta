@@ -150,7 +150,7 @@ def scrape_site(url: str, play_style: str, source_title: str) -> list[dict]:
 
 def scrape_codmunity() -> list[dict]:
     builds = scrape_site(
-        "https://codmunity.gg/meta",
+        "https://codmunity.gg/",
         play_style="Codmunity",
         source_title="codmunity.gg",
     )
