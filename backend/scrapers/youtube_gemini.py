@@ -1,10 +1,22 @@
 """
-Channel-based scraper: pulls videos + Shorts from each curated creator,
-passes the URL to Gemini for visual extraction of weapon builds, and
-groups results by play style (one play style per channel).
+Channel-based scraper using a TEXT-FIRST extraction strategy.
 
-Per channel dedupe: if the same weapon shows up in multiple recent
-videos/shorts, the most recent build wins.
+For each video we send Gemini a single text-only prompt containing the
+creator's title, full description, and (if available) auto-captions
+transcript. Gemini extracts the weapon builds the creator EXPLICITLY
+recommends as current-meta. If the text pass returns nothing AND the
+title looks like a build/loadout video, we fall back to a clipped
+visual analysis (head + tail of the video).
+
+Validation:
+- weapon_name must match (case-insensitive, ignoring dashes/spaces) one of
+  the canonical weapon names in wzhub.WARZONE_BUILDS. This kills
+  hallucinations and weapons from previous-game eras.
+- weapon_class is corrected to the canonical class for that weapon.
+- attachment SLOT names must be from a fixed list. Attachment NAMES
+  themselves are not whitelisted (they vary per build/season).
+
+Per channel dedupe: same canonical weapon → most recent video wins.
 """
 
 import os
@@ -14,8 +26,10 @@ import time
 from datetime import datetime, timedelta, timezone
 from googleapiclient.discovery import build as ytbuild
 
-# Channel → play style mapping. Uses the same channel IDs/handles that the
-# legacy youtube.py scraper already validated.
+# ──────────────────────────────────────────────────────────────────────────
+# Configuration
+# ──────────────────────────────────────────────────────────────────────────
+
 CHANNELS = [
     {"name": "Camy",       "id": "UC6MKLs52vIfPXWyatOQDXmw", "play_style": "Fast Movement"},
     {"name": "Lion",       "id": "UCnsRRitecBw8Vkx3ix1Ualw", "play_style": "Legacy Meta"},
@@ -29,36 +43,139 @@ CHANNELS = [
 
 DEFAULT_LOOKBACK_DAYS = 7
 GEMINI_MODEL = "gemini-2.5-flash"
-# Token-saving strategy: WZ creators almost always show their loadout
-# either at the start (intro/loadout reveal) or end (recap) of the video.
-# So instead of sending the entire video to Gemini we clip just two
-# windows — first HEAD_S seconds and last TAIL_S seconds — using
-# videoMetadata.start_offset/end_offset. This typically cuts per-video
-# token usage by 5–10×.
+
+# Pacing — text calls cost ~5–15K tokens each (vs 50–150K for video),
+# so we can do significantly more per minute.
+SLEEP_BETWEEN_CALLS_S = 4.0
+MAX_VIDEOS_PER_CHANNEL = 10
+
+# Visual fallback clip lengths (only used when text returned nothing)
 HEAD_S = 90
 TAIL_S = 90
-# Skip the tail if the gap between head and tail would be less than this
-# (otherwise we'd be sending overlapping clips for short videos).
 MIN_GAP_S = 30
-# Stay well under the free-tier 250K input-tokens-per-minute cap.
-SLEEP_BETWEEN_CALLS_S = 8.0
-MAX_VIDEOS_PER_CHANNEL = 5
 
-EXTRACTION_PROMPT = """You are analysing a Call of Duty: Warzone meta build video. The footage you see is the BEGINNING and END of the video — the segments where creators typically show their loadouts or summarise their picks.
+VALID_SLOTS = {
+    "Optic", "Muzzle", "Barrel", "Underbarrel", "Magazine", "Stock",
+    "Rear Grip", "Laser", "Fire Mods", "Conversion Kit", "Bolt",
+    "Comb", "Stock Pad", "Ammunition", "Trigger Action", "Arms", "Cable",
+}
+VALID_CLASSES = {"AR", "SMG", "LMG", "Sniper", "Shotgun", "Marksman", "Pistol"}
+VALID_TIERS = {"Absolute Meta", "Meta", "A", "B", "F"}
+VALID_DOMINANCIES = {"Long Range", "Close Range", "Sniper", "Support",
+                     "Hip Fire", "Aggressive", "Lowest Recoil"}
 
-Extract every distinct weapon build the creator showcases or recommends.
+# Title keywords that suggest the video is build/loadout content. Used to
+# gate the visual fallback (no point analysing a tournament gameplay clip).
+BUILD_TITLE_KEYWORDS = [
+    "loadout", "meta", "build", "best ", "tier ", "broken", " op ",
+    "class setup", "gun setup", "guide", "season", "s tier", "broken af",
+]
 
-For each build, return strict JSON with these fields:
-- weapon_name (string, exact in-game name)
-- weapon_class (one of: AR, SMG, LMG, Sniper, Shotgun, Marksman, Pistol)
-- tier (one of: "Absolute Meta", "Meta", "A", "B", "F" — infer from creator commentary; "this is the best" / "S-tier" → Absolute Meta; "very good / top pick" → Meta; "solid" → A; "okay / outdated" → B; "skip / bad" → F)
-- weapon_dominancy (one of: "Long Range", "Close Range", "Sniper", "Support", "Hip Fire", "Aggressive", "Lowest Recoil")
-- attachments (array of strings, format "<Slot>: <Name>" — e.g. "Optic: Slate Reflector")
-- confidence (float 0.0-1.0; how clearly the creator presents this build)
-- reasoning (one short sentence on why)
 
-Return ONLY a JSON object: {"builds": [...]}.
-If no clear builds are shown (e.g. the video is gameplay only, news, or reaction), return {"builds": []}."""
+# ──────────────────────────────────────────────────────────────────────────
+# Whitelist (built lazily from wzhub.WARZONE_BUILDS)
+# ──────────────────────────────────────────────────────────────────────────
+
+_VALID_WEAPONS_CACHE: dict[str, str] | None = None
+_WEAPON_TO_CLASS_CACHE: dict[str, str] | None = None
+
+
+def _normalize_for_match(s: str) -> str:
+    return re.sub(r"[\s\-_.]+", "", s.lower())
+
+
+def _ensure_weapon_cache() -> None:
+    global _VALID_WEAPONS_CACHE, _WEAPON_TO_CLASS_CACHE
+    if _VALID_WEAPONS_CACHE is not None:
+        return
+    valid: dict[str, str] = {}
+    classes: dict[str, str] = {}
+    try:
+        from scrapers.wzhub import WARZONE_BUILDS
+    except ImportError:
+        try:
+            from .wzhub import WARZONE_BUILDS  # type: ignore
+        except Exception:
+            print("[yt-gem] could not import wzhub.WARZONE_BUILDS — whitelist empty!")
+            _VALID_WEAPONS_CACHE = valid
+            _WEAPON_TO_CLASS_CACHE = classes
+            return
+    for b in WARZONE_BUILDS:
+        canonical = b["weapon_name"]
+        wclass = b["weapon_class"]
+        valid[canonical.lower()] = canonical
+        valid[_normalize_for_match(canonical)] = canonical
+        classes[canonical] = wclass
+    _VALID_WEAPONS_CACHE = valid
+    _WEAPON_TO_CLASS_CACHE = classes
+
+
+def _normalize_weapon_name(name: str) -> str | None:
+    """Return canonical name from wzhub list, or None if not whitelisted."""
+    if not name:
+        return None
+    _ensure_weapon_cache()
+    n = name.strip().lower()
+    if n in _VALID_WEAPONS_CACHE:  # type: ignore[operator]
+        return _VALID_WEAPONS_CACHE[n]  # type: ignore[index]
+    return _VALID_WEAPONS_CACHE.get(_normalize_for_match(n))  # type: ignore[union-attr]
+
+
+def _canonical_class_for(weapon: str) -> str | None:
+    _ensure_weapon_cache()
+    return _WEAPON_TO_CLASS_CACHE.get(weapon)  # type: ignore[union-attr]
+
+
+def _valid_weapons_for_prompt() -> str:
+    _ensure_weapon_cache()
+    seen: set[str] = set()
+    out: list[str] = []
+    for v in _VALID_WEAPONS_CACHE.values():  # type: ignore[union-attr]
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+    out.sort()
+    return ", ".join(out)
+
+
+def _validate_build(b: dict) -> dict | None:
+    """Sanitize a raw Gemini build dict; return None to drop."""
+    canonical = _normalize_weapon_name(b.get("weapon_name", ""))
+    if not canonical:
+        return None  # not on whitelist → drop
+
+    wclass_input = (b.get("weapon_class") or "").strip()
+    canonical_class = _canonical_class_for(canonical)
+    wclass = canonical_class or (wclass_input if wclass_input in VALID_CLASSES else "AR")
+
+    tier = b.get("tier") or "A"
+    if tier not in VALID_TIERS:
+        tier = "A"
+
+    dominancy = b.get("weapon_dominancy")
+    if dominancy not in VALID_DOMINANCIES:
+        dominancy = None
+
+    raw_atts = b.get("attachments") or []
+    clean_atts: list[str] = []
+    for att in raw_atts:
+        if not isinstance(att, str) or ":" not in att:
+            continue
+        slot, name = att.split(":", 1)
+        slot = slot.strip()
+        name = name.strip()
+        if slot in VALID_SLOTS and name:
+            clean_atts.append(f"{slot}: {name}")
+
+    return {
+        "weapon_name": canonical,
+        "weapon_class": wclass,
+        "tier": tier,
+        "weapon_dominancy": dominancy,
+        "attachments": clean_atts,
+        "confidence": float(b.get("confidence") or 0.7),
+        "reasoning": (b.get("reasoning") or "")[:300],
+    }
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -84,8 +201,7 @@ def _resolve_channel_id(youtube, channel: dict) -> str | None:
 
 
 def _list_recent_videos(youtube, channel_id: str, after: str) -> list[dict]:
-    """Returns list of {videoId, title, publishedAt} for videos AND shorts."""
-    out = []
+    out: list[dict] = []
     page_token = None
     while True:
         try:
@@ -116,7 +232,6 @@ _DURATION_RE = re.compile(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?")
 
 
 def _parse_iso_duration(s: str) -> int:
-    """ISO 8601 PT5M30S → 330 seconds. Returns 0 if unparseable."""
     if not s:
         return 0
     m = _DURATION_RE.match(s)
@@ -126,24 +241,37 @@ def _parse_iso_duration(s: str) -> int:
     return h * 3600 + mi * 60 + sec
 
 
-def _fetch_durations(youtube, video_ids: list[str]) -> dict[str, int]:
-    """Batch-fetch duration in seconds for up to 50 videos at a time."""
-    out: dict[str, int] = {}
+def _fetch_metadata(youtube, video_ids: list[str]) -> dict[str, dict]:
+    """Returns {video_id: {description, duration_s}} via videos.list."""
+    out: dict[str, dict] = {}
     for i in range(0, len(video_ids), 50):
         batch = video_ids[i:i + 50]
         try:
             resp = youtube.videos().list(
-                part="contentDetails", id=",".join(batch)
+                part="snippet,contentDetails", id=",".join(batch)
             ).execute()
             for item in resp.get("items", []):
                 vid = item["id"]
+                desc = item.get("snippet", {}).get("description", "")
                 dur = _parse_iso_duration(
                     item.get("contentDetails", {}).get("duration", "")
                 )
-                out[vid] = dur
+                out[vid] = {"description": desc, "duration_s": dur}
         except Exception as e:
-            print(f"[yt-gem] videos.list contentDetails failed: {e}")
+            print(f"[yt-gem] videos.list failed: {e}")
     return out
+
+
+def _fetch_transcript(video_id: str) -> str | None:
+    """Try to fetch English captions (often blocked from cloud IPs)."""
+    try:
+        from youtube_transcript_api import YouTubeTranscriptApi
+        chunks = YouTubeTranscriptApi.get_transcript(
+            video_id, languages=["en", "en-US", "en-GB"]
+        )
+        return " ".join(c["text"] for c in chunks)
+    except Exception:
+        return None
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -151,11 +279,8 @@ def _fetch_durations(youtube, video_ids: list[str]) -> dict[str, int]:
 # ──────────────────────────────────────────────────────────────────────────
 
 def _extract_json(text: str) -> dict:
-    """Pull the first JSON object out of Gemini's response."""
-    # Strip markdown fences
-    text = re.sub(r"^```(?:json)?\s*", "", text.strip())
+    text = re.sub(r"^```(?:json)?\s*", "", (text or "").strip())
     text = re.sub(r"\s*```$", "", text)
-    # Find first {...} block
     m = re.search(r"\{.*\}", text, re.DOTALL)
     if not m:
         return {"builds": []}
@@ -165,83 +290,169 @@ def _extract_json(text: str) -> dict:
         return {"builds": []}
 
 
-def _build_clipped_content(video_url: str, duration_s: int):
-    """Build a Content with the first HEAD_S and last TAIL_S of the video,
-    instead of the whole thing — drastically reduces input tokens."""
+def _today_label() -> str:
+    return datetime.now().strftime("%B %Y")
+
+
+def _build_text_prompt(title: str, description: str, transcript: str | None) -> str:
+    return f"""You are analysing a Call of Duty: Warzone meta-build YouTube video.
+
+Today is {_today_label()} — Warzone is currently in the BO7 (Black Ops 7) era.
+
+Below is the creator's title, full description, and (if available) auto-captions transcript. Extract every weapon build the creator EXPLICITLY recommends as a CURRENT-meta loadout.
+
+STRICT FILTERING RULES:
+- IGNORE weapons the creator describes as old, outdated, or no longer meta.
+- IGNORE casual mentions like "I used this last season" or "back when X was meta".
+- IGNORE comparison clips that aren't recommendations.
+- ONLY include weapons whose name (case-insensitive, ignoring dashes/spaces) matches one from this list:
+{_valid_weapons_for_prompt()}
+
+If a weapon is not in this list — even if the creator clearly recommends it — DO NOT include it.
+
+For each qualifying build, return strict JSON with these fields:
+- weapon_name: exact match from the list above
+- weapon_class: AR, SMG, LMG, Sniper, Shotgun, Marksman, or Pistol
+- tier: infer from creator's words —
+    * "Absolute Meta" if they say "best", "S-tier", "absolutely broken", "the new king"
+    * "Meta" if they say "top pick", "very strong", "great choice"
+    * "A" if "solid", "decent", "viable"
+    * "B" if "okay" or "outclassed"
+    * "F" if "skip", "trash", "don't use"
+- weapon_dominancy: Long Range, Close Range, Sniper, Support, Hip Fire, Aggressive, or Lowest Recoil
+- attachments: array of "<Slot>: <Name>" — ONLY for attachments the creator EXPLICITLY mentions by name. Skip slots they don't specify.
+    Slot must be one of: Optic, Muzzle, Barrel, Underbarrel, Magazine, Stock, Rear Grip, Laser, Fire Mods, Conversion Kit, Bolt, Comb, Stock Pad, Ammunition, Trigger Action.
+    DO NOT GUESS attachments. If the creator doesn't say it, leave it out.
+- confidence: 0.0–1.0 — high if the creator gives a full clear recommendation; low if it's a fleeting mention.
+- reasoning: one short sentence (paraphrase the creator's reasoning).
+
+Return ONLY: {{"builds": [...]}}. If nothing qualifies, return {{"builds": []}}.
+
+────── VIDEO METADATA ──────
+
+TITLE: {title}
+
+DESCRIPTION:
+{(description or "(none)")[:5000]}
+
+TRANSCRIPT:
+{(transcript or "(no transcript available)")[:8000]}
+"""
+
+
+def _build_visual_prompt() -> str:
+    return f"""You are analysing a Call of Duty: Warzone meta-build YouTube video. The clips are the BEGINNING and END of the video — where creators usually showcase loadouts.
+
+Today is {_today_label()}. Warzone is in the BO7 era.
+
+ONLY include weapons whose name matches one from this list:
+{_valid_weapons_for_prompt()}
+
+For each build return strict JSON:
+- weapon_name (from list above)
+- weapon_class (AR, SMG, LMG, Sniper, Shotgun, Marksman, or Pistol)
+- tier ("Absolute Meta", "Meta", "A", "B", "F")
+- weapon_dominancy (Long Range, Close Range, Sniper, Support, Hip Fire, Aggressive, Lowest Recoil)
+- attachments: array of "<Slot>: <Name>" you can clearly see on-screen. Slot from: Optic, Muzzle, Barrel, Underbarrel, Magazine, Stock, Rear Grip, Laser, Fire Mods, Conversion Kit, Bolt, Comb, Stock Pad, Ammunition, Trigger Action.
+- confidence (0.0–1.0)
+- reasoning (one short sentence)
+
+Return ONLY: {{"builds": [...]}}. Drop weapons not in the list.
+"""
+
+
+def _gemini_call_with_retry(make_request_fn, label: str, max_retries: int = 2) -> list[dict]:
+    """Generic retry wrapper for Gemini calls. make_request_fn() returns the response."""
+    for attempt in range(max_retries + 1):
+        try:
+            resp = make_request_fn()
+            text = (resp.text or "").strip()
+            if not text:
+                return []
+            parsed = _extract_json(text)
+            builds = parsed.get("builds", [])
+            return builds if isinstance(builds, list) else []
+        except Exception as e:
+            err = str(e)
+            permission = "403" in err or "PERMISSION_DENIED" in err
+            if permission:
+                print(f"[yt-gem] {label}: 403 (skipping)")
+                return []
+            transient = ("429" in err or "RESOURCE_EXHAUSTED" in err
+                         or "503" in err or "UNAVAILABLE" in err)
+            if transient and attempt < max_retries:
+                m = re.search(r"retry in ([\d.]+)s", err)
+                wait = float(m.group(1)) if m else 30 * (attempt + 1)
+                wait += 5
+                print(f"[yt-gem] {label}: transient err, sleep {wait:.1f}s")
+                time.sleep(wait)
+                continue
+            print(f"[yt-gem] {label} failed: {type(e).__name__}: {err[:200]}")
+            return []
+    return []
+
+
+def _gemini_text_call(prompt: str, client) -> list[dict]:
+    return _gemini_call_with_retry(
+        lambda: client.models.generate_content(model=GEMINI_MODEL, contents=prompt),
+        label="text",
+    )
+
+
+def _build_visual_content(video_url: str, duration_s: int):
     from google.genai import types
-
     parts = []
-
     if not duration_s or duration_s <= HEAD_S + MIN_GAP_S:
-        # Short video / unknown length — analyse the whole thing.
         parts.append(types.Part(file_data=types.FileData(file_uri=video_url)))
     else:
         head_end = min(HEAD_S, duration_s)
         parts.append(types.Part(
             file_data=types.FileData(file_uri=video_url),
-            video_metadata=types.VideoMetadata(
-                start_offset=f"0s", end_offset=f"{head_end}s"
-            ),
+            video_metadata=types.VideoMetadata(start_offset="0s", end_offset=f"{head_end}s"),
         ))
-        # Tail: only add if it doesn't overlap with the head.
         tail_start = max(head_end + MIN_GAP_S, duration_s - TAIL_S)
         if tail_start < duration_s:
             parts.append(types.Part(
                 file_data=types.FileData(file_uri=video_url),
-                video_metadata=types.VideoMetadata(
-                    start_offset=f"{tail_start}s", end_offset=f"{duration_s}s"
-                ),
+                video_metadata=types.VideoMetadata(start_offset=f"{tail_start}s", end_offset=f"{duration_s}s"),
             ))
-
-    parts.append(types.Part(text=EXTRACTION_PROMPT))
+    parts.append(types.Part(text=_build_visual_prompt()))
     return types.Content(parts=parts)
 
 
-def _gemini_extract(video_url: str, duration_s: int, client, max_retries: int = 2) -> list[dict]:
-    """Send a YouTube URL to Gemini and return its parsed builds list.
-    Retries on 429 (rate limit) with backoff parsed from the error if available."""
-    contents = _build_clipped_content(video_url, duration_s)
+def _gemini_visual_call(video_url: str, duration_s: int, client) -> list[dict]:
+    contents = _build_visual_content(video_url, duration_s)
+    return _gemini_call_with_retry(
+        lambda: client.models.generate_content(model=GEMINI_MODEL, contents=contents),
+        label=f"visual({video_url})",
+    )
 
-    for attempt in range(max_retries + 1):
-        try:
-            resp = client.models.generate_content(model=GEMINI_MODEL, contents=contents)
-            text = (resp.text or "").strip()
-            if not text:
-                print(f"[yt-gem] empty response for {video_url}")
-                return []
-            parsed = _extract_json(text)
-            builds = parsed.get("builds", [])
-            if not isinstance(builds, list):
-                return []
-            names = ", ".join(b.get("weapon_name", "?") for b in builds[:5])
-            print(f"[yt-gem]   {video_url}: {len(builds)} builds [{names}]")
-            return builds
-        except Exception as e:
-            err_msg = str(e)
-            is_rate_limit = "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg
-            is_overloaded = "503" in err_msg or "UNAVAILABLE" in err_msg
-            is_permission = "403" in err_msg or "PERMISSION_DENIED" in err_msg
 
-            if is_permission:
-                print(f"[yt-gem] {video_url}: 403 (skipping)")
-                return []
+def _looks_like_build_video(title: str) -> bool:
+    t = title.lower()
+    return any(k in t for k in BUILD_TITLE_KEYWORDS)
 
-            if (is_rate_limit or is_overloaded) and attempt < max_retries:
-                # Parse retryDelay if Gemini provided one; otherwise exp backoff.
-                m = re.search(r"retry in ([\d.]+)s", err_msg)
-                wait = float(m.group(1)) if m else (15 * (attempt + 1))
-                if is_overloaded:
-                    # Server overload — wait a bit longer.
-                    wait = max(wait, 30 * (attempt + 1))
-                wait += 5
-                code = "429" if is_rate_limit else "503"
-                print(f"[yt-gem] {code} on {video_url} — sleeping {wait:.1f}s then retrying")
-                time.sleep(wait)
-                continue
 
-            print(f"[yt-gem] gemini call failed for {video_url}: {type(e).__name__}: {err_msg[:200]}")
-            return []
-    return []
+def _extract_for_video(video_url: str, video_id: str, title: str,
+                       meta: dict, client) -> tuple[list[dict], str]:
+    """Try text first; visual fallback if text empty AND title suggests builds."""
+    description = meta.get("description", "") if meta else ""
+    duration_s = meta.get("duration_s", 0) if meta else 0
+    transcript = _fetch_transcript(video_id)
+
+    prompt = _build_text_prompt(title, description, transcript)
+    raw = _gemini_text_call(prompt, client)
+    if raw:
+        return raw, "text"
+
+    if _looks_like_build_video(title):
+        time.sleep(2)
+        raw = _gemini_visual_call(video_url, duration_s, client)
+        if raw:
+            return raw, "visual"
+        return [], "visual-empty"
+
+    return [], "text-empty"
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -260,19 +471,26 @@ def scrape(lookback_days: int = DEFAULT_LOOKBACK_DAYS) -> list[dict]:
 
     try:
         from google import genai
-        print(f"[yt-gem] google-genai package loaded OK")
+        from google.genai import types as gtypes
+        print("[yt-gem] google-genai package loaded OK")
     except ImportError as e:
         print(f"[yt-gem] google-genai package missing ({e}), skipping")
         return []
 
     try:
-        from google.genai import types as gtypes
         gemini = genai.Client(
             api_key=gem_key,
-            http_options=gtypes.HttpOptions(timeout=120_000),  # 2 min per video
+            http_options=gtypes.HttpOptions(timeout=120_000),
         )
     except Exception as e:
         print(f"[yt-gem] failed to construct Gemini client: {e}")
+        return []
+
+    _ensure_weapon_cache()
+    n_unique = len(set(_VALID_WEAPONS_CACHE.values()))  # type: ignore[union-attr]
+    print(f"[yt-gem] whitelist: {n_unique} canonical weapons")
+    if n_unique == 0:
+        print("[yt-gem] empty whitelist — every extraction would be dropped, abort")
         return []
 
     youtube = ytbuild("youtube", "v3", developerKey=yt_key, cache_discovery=False)
@@ -286,46 +504,38 @@ def scrape(lookback_days: int = DEFAULT_LOOKBACK_DAYS) -> list[dict]:
             continue
 
         videos = _list_recent_videos(youtube, ch_id, after)
-        # newest first
         videos.sort(key=lambda v: v["publishedAt"], reverse=True)
         videos = videos[:MAX_VIDEOS_PER_CHANNEL]
-        print(f"[yt-gem] {channel['name']}: processing {len(videos)} most-recent videos in last {lookback_days}d")
+        print(f"[yt-gem] {channel['name']}: {len(videos)} videos in last {lookback_days}d")
 
-        # Batch-fetch durations so we can clip head + tail.
-        durations = _fetch_durations(youtube, [v["videoId"] for v in videos])
+        metas = _fetch_metadata(youtube, [v["videoId"] for v in videos])
 
-        # Per-channel dedupe: weapon_name → first build seen (newest wins because list is sorted)
+        # Per-channel dedupe by canonical weapon name (newest video wins)
         seen: dict[str, dict] = {}
 
         for v in videos:
             url = f"https://youtube.com/watch?v={v['videoId']}"
-            dur_s = durations.get(v["videoId"], 0)
-            builds = _gemini_extract(url, dur_s, gemini)
+            meta = metas.get(v["videoId"], {})
+            raw, method = _extract_for_video(url, v["videoId"], v["title"], meta, gemini)
             time.sleep(SLEEP_BETWEEN_CALLS_S)
 
-            for b in builds:
-                wname = (b.get("weapon_name") or "").strip()
-                if not wname:
-                    continue
-                key = wname.lower()
+            valid_builds: list[dict] = []
+            for b in raw:
+                vb = _validate_build(b)
+                if vb:
+                    valid_builds.append(vb)
+
+            names = ", ".join(b["weapon_name"] for b in valid_builds[:5])
+            print(f"[yt-gem]   {url} via {method}: {len(valid_builds)} valid / {len(raw)} raw [{names}]")
+
+            for vb in valid_builds:
+                key = vb["weapon_name"].lower()
                 if key in seen:
-                    continue  # already have a more recent build for this weapon
-
-                wclass = (b.get("weapon_class") or "").strip() or "AR"
-                tier = b.get("tier") or "A"
-                if tier not in ("Absolute Meta", "Meta", "A", "B", "F"):
-                    tier = "A"
-
+                    continue
                 seen[key] = {
-                    "weapon_name": wname,
-                    "weapon_class": wclass,
+                    **vb,
                     "game": "Warzone",
                     "play_style": channel["play_style"],
-                    "weapon_dominancy": b.get("weapon_dominancy"),
-                    "tier": tier,
-                    "attachments": b.get("attachments") or [],
-                    "confidence": float(b.get("confidence") or 0.7),
-                    "reasoning": b.get("reasoning") or "",
                     "source_type": "youtube",
                     "source_url": url,
                     "source_title": f"{channel['name']} — {v['title'][:80]}",
@@ -336,7 +546,7 @@ def scrape(lookback_days: int = DEFAULT_LOOKBACK_DAYS) -> list[dict]:
                 }
 
         final.extend(seen.values())
-        print(f"[yt-gem] {channel['name']}: {len(seen)} unique builds extracted")
+        print(f"[yt-gem] {channel['name']}: {len(seen)} unique builds")
 
     print(f"[yt-gem] total builds across all channels: {len(final)}")
     return final
