@@ -351,7 +351,9 @@ def _build_text_prompt(title: str, description: str, transcript: str | None) -> 
 
 Today is {_today_label()} — Warzone is currently in the BO7 (Black Ops 7) era.
 
-Below is the creator's title, full description, and (if available) auto-captions transcript. Extract every weapon build the creator EXPLICITLY recommends as a CURRENT-meta loadout.
+Below is the creator's title, full description, and (if available) auto-captions transcript. **You also have Google Search available** — use it to pull in additional context about this video: third-party recaps, tier-list mentions, comment summaries, the creator's other recent uploads, anything that helps you identify the EXACT weapons + attachments the creator recommends. Don't speculate — only include builds you can verify either from the metadata below or from search results.
+
+Extract every weapon build the creator EXPLICITLY recommends as a CURRENT-meta loadout.
 
 STRICT FILTERING RULES:
 - IGNORE weapons the creator describes as old, outdated, or no longer meta.
@@ -445,8 +447,18 @@ def _gemini_call_with_retry(make_request_fn, label: str, max_retries: int = 2) -
 
 
 def _gemini_text_call(prompt: str, client) -> list[dict]:
+    """Text call WITH Google Search grounding so Gemini can supplement
+    the title/description/transcript we provide with anything Google has
+    indexed about the video (third-party recaps, comment summaries,
+    creator's other content, tier-list mentions, etc.)."""
+    from google.genai import types
+    config = types.GenerateContentConfig(
+        tools=[types.Tool(google_search=types.GoogleSearch())],
+    )
     return _gemini_call_with_retry(
-        lambda: client.models.generate_content(model=GEMINI_MODEL, contents=prompt),
+        lambda: client.models.generate_content(
+            model=GEMINI_MODEL, contents=prompt, config=config
+        ),
         label="text",
     )
 
