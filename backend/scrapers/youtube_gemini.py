@@ -46,13 +46,24 @@ GEMINI_MODEL = "gemini-2.5-flash"
 
 # Pacing — text calls cost ~5–15K tokens each (vs 50–150K for video),
 # so we can do significantly more per minute.
-SLEEP_BETWEEN_CALLS_S = 4.0
+SLEEP_BETWEEN_CALLS_S = 6.0
 MAX_VIDEOS_PER_CHANNEL = 10
 
-# Visual fallback clip lengths (only used when text returned nothing)
+# Visual usage is OFF by default — a single visual call burns ~50–100K
+# tokens, half the free-tier per-minute budget. Once quota is hit, every
+# subsequent call (incl. cheap text ones) gets 429 for 5+ minutes.
+# Set ENABLE_VISUAL_ENRICH=1 / ENABLE_VISUAL_FALLBACK=1 to opt in once
+# you're on a paid Gemini tier.
+ENABLE_VISUAL_ENRICH = os.environ.get("ENABLE_VISUAL_ENRICH", "0") == "1"
+ENABLE_VISUAL_FALLBACK = os.environ.get("ENABLE_VISUAL_FALLBACK", "0") == "1"
+
+# Visual fallback clip lengths (only used when ENABLE_VISUAL_FALLBACK=1)
 HEAD_S = 90
 TAIL_S = 90
 MIN_GAP_S = 30
+# Min seconds between two visual calls so we don't spike the quota.
+VISUAL_COOLDOWN_S = 60.0
+_last_visual_at = 0.0
 
 VALID_SLOTS = {
     "Optic", "Muzzle", "Barrel", "Underbarrel", "Magazine", "Stock",
@@ -361,9 +372,9 @@ For each qualifying build, return strict JSON with these fields:
     * "B" if "okay" or "outclassed"
     * "F" if "skip", "trash", "don't use"
 - weapon_dominancy: Long Range, Close Range, Sniper, Support, Hip Fire, Aggressive, or Lowest Recoil
-- attachments: array of "<Slot>: <Name>" — ONLY for attachments the creator EXPLICITLY mentions by name. Skip slots they don't specify.
+- attachments: array of "<Slot>: <Name>" — pull from EITHER (a) the description (creators often list full loadouts there with patterns like "Optic: X / Muzzle: Y" or bullet-pointed slot:name pairs) OR (b) attachments the creator names in the transcript. INCLUDE every slot:name pair you can find in the description, in order.
     Slot must be one of: Optic, Muzzle, Barrel, Underbarrel, Magazine, Stock, Rear Grip, Laser, Fire Mods, Conversion Kit, Bolt, Comb, Stock Pad, Ammunition, Trigger Action.
-    DO NOT GUESS attachments. If the creator doesn't say it, leave it out.
+    Do not invent attachments — but if the description lists them, use those even if the creator doesn't speak them out loud.
 - confidence: 0.0–1.0 — high if the creator gives a full clear recommendation; low if it's a fleeting mention.
 - reasoning: one short sentence (paraphrase the creator's reasoning).
 
@@ -462,6 +473,15 @@ def _build_visual_content(video_url: str, duration_s: int):
 
 
 def _gemini_visual_call(video_url: str, duration_s: int, client) -> list[dict]:
+    """Visual call respects a global cooldown so we don't blow the quota."""
+    global _last_visual_at
+    elapsed = time.time() - _last_visual_at
+    if elapsed < VISUAL_COOLDOWN_S:
+        wait = VISUAL_COOLDOWN_S - elapsed
+        print(f"[yt-gem] visual cooldown — waiting {wait:.1f}s")
+        time.sleep(wait)
+    _last_visual_at = time.time()
+
     contents = _build_visual_content(video_url, duration_s)
     return _gemini_call_with_retry(
         lambda: client.models.generate_content(model=GEMINI_MODEL, contents=contents),
@@ -509,8 +529,8 @@ def _enrich_attachments(text_builds: list[dict], video_url: str,
 
 def _extract_for_video(video_url: str, video_id: str, title: str,
                        meta: dict, client) -> tuple[list[dict], str]:
-    """Try text first. Enrich missing attachments visually. Fall back to
-    visual-only when text returned nothing AND title suggests builds."""
+    """Text-first; both visual paths gated behind opt-in env flags so the
+    free-tier Gemini quota isn't burnt on long videos."""
     description = meta.get("description", "") if meta else ""
     duration_s = meta.get("duration_s", 0) if meta else 0
     transcript = _fetch_transcript(video_id)
@@ -518,10 +538,14 @@ def _extract_for_video(video_url: str, video_id: str, title: str,
     prompt = _build_text_prompt(title, description, transcript)
     raw = _gemini_text_call(prompt, client)
     if raw:
-        raw = _enrich_attachments(raw, video_url, duration_s, client)
-        return raw, "text+enrich" if any(b.get("attachments") for b in raw) else "text"
+        if ENABLE_VISUAL_ENRICH:
+            raw = _enrich_attachments(raw, video_url, duration_s, client)
+            label = "text+enrich" if any(b.get("attachments") for b in raw) else "text"
+        else:
+            label = "text"
+        return raw, label
 
-    if _looks_like_build_video(title):
+    if ENABLE_VISUAL_FALLBACK and _looks_like_build_video(title):
         time.sleep(2)
         raw = _gemini_visual_call(video_url, duration_s, client)
         if raw:
