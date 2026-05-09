@@ -62,10 +62,17 @@ APScheduler with `Asia/Jerusalem` timezone. Two cron jobs:
 
 ### API endpoints
 - `GET /api/builds?game=Warzone&playStyle=...&weaponDominancy=A,B` — list filtered builds. `weaponDominancy` is comma-separated for multi-select.
-- `GET /api/stats` — total + by-tier + last_scraped + next_weekly + next_daily.
-- `POST /api/pipeline/run-weekly` — manual trigger (header `x-pipeline-secret`).
-- `POST /api/pipeline/run-daily` — manual trigger.
-- Legacy `POST /api/pipeline/run` exists for backward compat.
+- `GET /api/stats` — total + by-tier + last_scraped + next_weekly + next_daily + **`pipeline_running` (bool)** + **`pipeline_mode` (str|null)**. Used by the Admin UI to disable buttons during a run.
+- `POST /api/pipeline/run-weekly` — manual trigger (header `x-pipeline-secret`). Returns **HTTP 409** if a pipeline is already running.
+- `POST /api/pipeline/run-daily` — manual trigger. Same 409 behaviour.
+- Legacy `POST /api/pipeline/run` exists for backward compat (also gated by mutex).
+
+### Pipeline mutex
+`api.py` holds a process-wide `threading.Lock` (`_PIPELINE_LOCK`) and a `_PIPELINE_STATE` dict. Both manual triggers and the cron scheduler funnel through `_run_with_lock(mode_label, fn)`:
+- If the lock is free → take it, run, release.
+- If the lock is held → log a skip line and no-op (the HTTP layer also pre-flights with `_refuse_if_running()` and returns 409 before spawning a thread).
+
+This prevents the bug we hit where clicking Daily then Weekly ~40s apart fired two pipeline threads in parallel — both calling Gemini, both blowing the per-minute quota, both stuck in 429 loops while logs interleaved confusingly.
 
 ### Frontend layout (`/`)
 1. `Header` — title + last_scraped (formatted in Asia/Jerusalem) + next_scrape + Admin button.
@@ -79,6 +86,8 @@ APScheduler with `Asia/Jerusalem` timezone. Two cron jobs:
 `/admin` has two buttons:
 - **Weekly Refresh (7 days)** — full pipeline incl. site scrapers
 - **Daily Refresh (today)** — YouTube + wzhub only
+
+The Admin page polls `/api/stats` every 5s. If `pipeline_running` is true, both buttons are disabled and a yellow banner reads "A {mode} run is already in progress on the server". The page handles 409 responses with a clear error instead of pretending success.
 
 ## Environment variables (Railway)
 - `ANTHROPIC_API_KEY` — left in env but unused (Claude was removed)
@@ -103,11 +112,16 @@ SDK forbids it. So:
 - Visual path (FileData) — has no grounding tool ✗
 
 ### Free-tier Gemini 250K-input-tokens-per-minute cap
-Hard ceiling. Heavy grounded calls (codmunity + wzstats) easily blow it if back-to-back. Mitigations:
-- Site scrapers only run on weekly, with 30s sleep between them and 60s cooldown before YouTube
+Hard ceiling. Both site scrapers AND the YouTube text call use `Tool(google_search=GoogleSearch())`, which makes each call ~50–100K input tokens (search grounding pulls retrieved page content into the input window). Three or four back-to-back grounded calls will burn the budget and cascade 429s into every subsequent call (including cheap ones) for 5+ minutes.
+
+Mitigations stacked:
+- Site scrapers only run on **weekly**, with 30s sleep between codmunity → wzstats and a 60s cooldown after wzstats before YouTube starts
 - YouTube text calls sleep 6s between them
-- Visual calls have a global 60s cooldown when enabled
-- 429s auto-retry with backoff parsed from Gemini's error
+- Visual calls (when opted in) have a global 60s cooldown
+- 429 / 503 auto-retry with backoff parsed from Gemini's error message
+- **Pipeline mutex** prevents two pipeline threads colliding on the same key
+
+If users still hit quota issues, the only real fix is upgrading Gemini to the paid tier (which raises the per-minute limit dramatically).
 
 ### Why MetaHub / MapsHub / CamoHub were removed
 The play-style filter rework made them redundant — the user wanted a single "Meta Builds" view with all the filtering inline. Map information now appears as a "Best Maps" toggle inside each WeaponCard, computed from the weapon's `weapon_dominancy`.
@@ -117,6 +131,9 @@ Returns `None` most of the time because YouTube blocks bulk transcript requests 
 
 ### Per-source dedup vs cross-source
 Within one play_style we keep only ONE row per `(weapon_name, weapon_class, game, play_style)`. Across play_styles, the same weapon CAN appear multiple times (e.g. Voyak KT-3 from Camy AND from Lion are kept separate, since they may have different attachments).
+
+### Why `last_scraped` may show stale time
+`log_scrape()` only fires at the END of a successful pipeline run. If a run hangs on an external call (Gemini timeout, codmunity hang) past the hard timeout, the futures-based `step()` wrapper kills it but the pipeline still proceeds — and if all subsequent steps return zero, `log_scrape()` still fires with 0 builds. If the entire pipeline thread is killed (Railway container restart mid-run), `last_scraped` stays at whatever value it had from the previous successful run. Always cross-check the timestamp against the build count — if count = 166 but timestamp is days old, something killed the most recent run partway.
 
 ## Running locally
 
