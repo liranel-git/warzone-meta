@@ -30,12 +30,16 @@ from scrapers.gemini_site import scrape_codmunity, scrape_wzstats
 # url_context approach). Default ON; set ENABLE_GEMINI_SITES=0 to skip.
 ENABLE_GEMINI_SITES = os.environ.get("ENABLE_GEMINI_SITES", "1") == "1"
 
-# All play-style buckets we manage. Wiped before every run so stale rows
-# (hallucinated weapons from pre-whitelist runs, channels that went silent,
-# etc.) don't linger in the UI.
-KNOWN_PLAY_STYLES: list[str] = ["WZ Hub", "Codmunity", "WZ Meta"] + [
-    ch["play_style"] for ch in YT_CHANNELS
-]
+# Bucket groupings — used to scope the per-run wipe.
+SITE_PLAY_STYLES: list[str] = ["Codmunity", "WZ Meta"]
+WZHUB_PLAY_STYLE: str = "WZ Hub"
+YT_PLAY_STYLES: list[str] = [ch["play_style"] for ch in YT_CHANNELS]
+
+# Daily runs refresh ONLY wzhub + YouTube channels. Codmunity / WZ Meta
+# are weekly-only (their grounded calls are expensive). So a daily run
+# must NOT wipe those buckets, or they go blank between weekly runs.
+DAILY_SCOPE: list[str] = [WZHUB_PLAY_STYLE] + YT_PLAY_STYLES
+WEEKLY_SCOPE: list[str] = SITE_PLAY_STYLES + [WZHUB_PLAY_STYLE] + YT_PLAY_STYLES
 
 
 def _run_with_youtube_lookback(lookback_days: int, label: str):
@@ -91,12 +95,12 @@ def _run_with_youtube_lookback(lookback_days: int, label: str):
         hard_timeout_s=60 * 30,
     )
 
-    # ALWAYS wipe every known play-style bucket — even ones where we
-    # didn't extract anything this run. Otherwise stale rows from older
-    # runs (hallucinated weapons before the whitelist, channels that went
-    # silent for a few days) hang around in the UI forever.
-    deleted_total = delete_builds_by_play_style(KNOWN_PLAY_STYLES)
-    print(f"[pipeline] wiped {deleted_total} rows across {len(KNOWN_PLAY_STYLES)} known play_styles", flush=True)
+    # Scope of the wipe depends on the mode. Daily runs MUST leave the
+    # Codmunity / WZ Meta buckets alone — otherwise every daily empties
+    # the site data and we have to wait a week for it to repopulate.
+    scope = WEEKLY_SCOPE if label == "weekly" else DAILY_SCOPE
+    deleted_total = delete_builds_by_play_style(scope)
+    print(f"[pipeline] wiped {deleted_total} rows across {len(scope)} in-scope play_styles ({label})", flush=True)
 
     if not builds:
         print(f"[pipeline] {label}: nothing to upsert (all buckets now empty)")
