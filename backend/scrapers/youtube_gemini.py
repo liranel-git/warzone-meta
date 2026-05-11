@@ -190,6 +190,36 @@ def _valid_weapons_for_prompt() -> str:
     return ", ".join(out)
 
 
+# Generic / hallucinated attachment-name patterns. If a Gemini-returned name
+# matches any of these (case-insensitive), we drop the attachment because it's
+# almost certainly not a real in-game name.
+_GENERIC_ATT_PATTERNS = [
+    # Bare measurements: "18-inch barrel", "16 inch barrel", "22\" barrel"
+    re.compile(r"^\d{1,3}[\-\s\"']?(inch|in|\")?\s*(barrel|long\s*barrel|short\s*barrel)$", re.I),
+    # Bare round counts: "45 round mag", "60-round drum", "100 round belt"
+    re.compile(r"^\d{1,3}[\-\s]?round\s*(mag|magazine|drum|belt)$", re.I),
+    # Pure generic mag names with no brand prefix
+    re.compile(r"^(extended|standard|tactical|fast)\s*mag(azine)?\s*(i{1,3}|ii)?$", re.I),
+    # Bare "FMJ" / "API" / "Tracer" / "Hollow Point" / "AP" with no calibre
+    re.compile(r"^(fmj|api|tracer|hollow\s*point|ap|incendiary)(\s*ammunition|\s*rounds)?$", re.I),
+    # Generic optic descriptions
+    re.compile(r"^(red\s*dot|iron\s*sights?|holographic|2x|3x|4x|6x)(\s*sight|\s*optic)?$", re.I),
+    # Pure generic grip / stock / suppressor / brake names
+    re.compile(r"^(vertical|ranger|commando|quickdraw|ergonomic|infiltrator)\s*(foregrip|grip|stock|pad)$", re.I),
+    re.compile(r"^(suppressor|silencer|muzzle\s*brake|compensator|flash\s*hider)$", re.I),
+    re.compile(r"^(short|long|reinforced|gain[-\s]?twist|heavy)\s*barrel$", re.I),
+    # "Light Stock", "Heavy Stock", "Balanced Stock" without brand
+    re.compile(r"^(light|heavy|balanced|no)\s*stock(\s*mod)?$", re.I),
+]
+
+
+def _looks_generic(name: str) -> bool:
+    n = name.strip()
+    if not n:
+        return True
+    return any(p.match(n) for p in _GENERIC_ATT_PATTERNS)
+
+
 def _validate_build(b: dict) -> dict | None:
     """Sanitize a raw Gemini build dict; return None to drop."""
     canonical = _normalize_weapon_name(b.get("weapon_name", ""))
@@ -210,14 +240,22 @@ def _validate_build(b: dict) -> dict | None:
 
     raw_atts = b.get("attachments") or []
     clean_atts: list[str] = []
+    dropped_generic = 0
     for att in raw_atts:
         if not isinstance(att, str) or ":" not in att:
             continue
         slot, name = att.split(":", 1)
         slot = slot.strip()
         name = name.strip()
-        if slot in VALID_SLOTS and name:
-            clean_atts.append(f"{slot}: {name}")
+        if slot not in VALID_SLOTS or not name:
+            continue
+        if _looks_generic(name):
+            dropped_generic += 1
+            continue
+        clean_atts.append(f"{slot}: {name}")
+
+    if dropped_generic:
+        print(f"[yt-gem]     {canonical}: dropped {dropped_generic} generic-looking attachment(s)")
 
     return {
         "weapon_name": canonical,
@@ -374,9 +412,14 @@ For each qualifying build, return strict JSON with these fields:
     * "B" if "okay" or "outclassed"
     * "F" if "skip", "trash", "don't use"
 - weapon_dominancy: Long Range, Close Range, Sniper, Support, Hip Fire, Aggressive, or Lowest Recoil
-- attachments: array of "<Slot>: <Name>" — pull from EITHER (a) the description (creators often list full loadouts there with patterns like "Optic: X / Muzzle: Y" or bullet-pointed slot:name pairs) OR (b) attachments the creator names in the transcript. INCLUDE every slot:name pair you can find in the description, in order.
+- attachments: array of "<Slot>: <Name>" — ONLY include attachments where you know the EXACT in-game name as shown in Warzone's gunsmith. Real attachments have proprietary brand-prefixed names — e.g. "Greaves Bellum Barrel", "Bowen Bighorn Drum", "Monolithic Suppressor", "5.56 NATO FMJ", "Hawker Cub-55 Pad", "VAS Drift Lock Foregrip".
+    DO NOT use generic descriptive names — these are hallucinations and will be dropped:
+      ✗ "18-inch barrel"  → no brand prefix
+      ✗ "45 round mag"    → use the in-game mag name like "Rhodes Drum Mag"
+      ✗ "FMJ ammunition"  → use the in-game name like "5.56 NATO FMJ"
+      ✗ "extended mag"    → use the specific extended mag's brand name
+    If you cannot find the exact in-game attachment name in the description, transcript, or search results, OMIT that slot entirely. An empty attachments array is far better than fabricated names.
     Slot must be one of: Optic, Muzzle, Barrel, Underbarrel, Magazine, Stock, Rear Grip, Laser, Fire Mods, Conversion Kit, Bolt, Comb, Stock Pad, Ammunition, Trigger Action.
-    Do not invent attachments — but if the description lists them, use those even if the creator doesn't speak them out loud.
 - confidence: 0.0–1.0 — high if the creator gives a full clear recommendation; low if it's a fleeting mention.
 - reasoning: one short sentence (paraphrase the creator's reasoning).
 
