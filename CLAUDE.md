@@ -51,9 +51,13 @@ Two entry points: `run_weekly()` (7-day YouTube lookback, runs site scrapers) an
 Each scraper runs inside `concurrent.futures.ThreadPoolExecutor` with a hard timeout. Codmunity / WZStats grounded calls are heavy (~50–100K input tokens each), so we sleep 30s between them and 60s after wzstats before YouTube starts, to let the per-minute Gemini quota refresh.
 
 After all scrapers finish, the pipeline:
-1. Wipes ALL known play_style buckets (`KNOWN_PLAY_STYLES`) regardless of whether each got fresh data — kills stale rows from older runs.
+1. Wipes the **in-scope** play_style buckets for the run's mode:
+   - `WEEKLY_SCOPE` = all 11 (Codmunity, WZ Meta, WZ Hub, 8 channels)
+   - `DAILY_SCOPE` = WZ Hub + 8 channels (NOT Codmunity / WZ Meta — those are weekly-only refreshes)
 2. Upserts whatever was scraped.
 3. Logs the run via `log_scrape()` so `last_scraped` timestamp updates.
+
+The scope split exists because Codmunity + WZ Meta use grounded Gemini calls (~50–100K input tokens each) — too expensive to run daily. If daily wiped them, they'd go blank for ~6 days at a time. Now they persist across daily runs and only refresh on weekly.
 
 ### Scheduler
 APScheduler with `Asia/Jerusalem` timezone. Two cron jobs:
