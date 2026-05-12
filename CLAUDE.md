@@ -50,14 +50,22 @@ Two entry points: `run_weekly()` (7-day YouTube lookback, runs site scrapers) an
 
 Each scraper runs inside `concurrent.futures.ThreadPoolExecutor` with a hard timeout. Codmunity / WZStats grounded calls are heavy (~50–100K input tokens each), so we sleep 30s between them and 60s after wzstats before YouTube starts, to let the per-minute Gemini quota refresh.
 
-After all scrapers finish, the pipeline:
-1. Wipes the **in-scope** play_style buckets for the run's mode:
+**Wipe-first, upsert-per-scraper.** The pipeline does:
+1. **Wipe** the **in-scope** play_style buckets at the very start of the run:
    - `WEEKLY_SCOPE` = all 11 (Codmunity, WZ Meta, WZ Hub, 8 channels)
    - `DAILY_SCOPE` = WZ Hub + 8 channels (NOT Codmunity / WZ Meta — those are weekly-only refreshes)
-2. Upserts whatever was scraped.
-3. Logs the run via `log_scrape()` so `last_scraped` timestamp updates.
+2. Run each scraper, **upsert its results immediately** when it returns. If a later scraper crashes or times out, earlier scrapers' data is already safely in the DB.
+3. `log_scrape()` at the end so `last_scraped` timestamp updates.
 
 The scope split exists because Codmunity + WZ Meta use grounded Gemini calls (~50–100K input tokens each) — too expensive to run daily. If daily wiped them, they'd go blank for ~6 days at a time. Now they persist across daily runs and only refresh on weekly.
+
+### YouTube partial-result safety
+`scrape_youtube_gemini(lookback_days, output_list=None)` accepts a shared list and appends every validated build to it as soon as the build is extracted. The pipeline passes its own list; even if the function gets killed by the 30-min hard timeout, whatever was extracted before the timeout is still upserted. Previously, a timeout meant losing ALL partial YouTube data.
+
+### Quota-death detection
+`youtube_gemini` tracks consecutive 429 errors in `_consecutive_429`. After 3 in a row it raises a `QuotaExhausted` exception, sets `_quota_dead = True`, and every subsequent Gemini call in this run short-circuits to `[]` without sending the request. The outer channel loop also checks the flag and skips remaining channels. This prevents the "grind on 429 for 30 minutes burning quota one futile call at a time" failure mode we hit when the free-tier daily quota was exhausted.
+
+Additionally, the pipeline itself checks for quota death: if codmunity AND wzstats both return 0 builds at the start of a weekly run (the canary for a dead daily quota), it skips youtube_gemini entirely to preserve whatever quota is left.
 
 ### Scheduler
 APScheduler with `Asia/Jerusalem` timezone. Two cron jobs:
