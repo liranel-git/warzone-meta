@@ -15,7 +15,6 @@ import os
 import sys
 import time
 import concurrent.futures
-from collections import defaultdict
 from dotenv import load_dotenv
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
@@ -45,9 +44,10 @@ WEEKLY_SCOPE: list[str] = SITE_PLAY_STYLES + [WZHUB_PLAY_STYLE] + YT_PLAY_STYLES
 def _run_with_youtube_lookback(lookback_days: int, label: str):
     init_db()
 
-    builds: list[dict] = []
-
-    def step(name, fn, hard_timeout_s):
+    def run_step(name, fn, hard_timeout_s):
+        """Run a scraper with hard timeout. Returns the result list, or [] if
+        the scraper timed out / failed. Does NOT mutate the DB — caller
+        decides what to upsert."""
         t0 = time.time()
         print(f"[pipeline] >>> starting {name} (hard-timeout {hard_timeout_s}s)", flush=True)
         sys.stdout.flush()
@@ -55,74 +55,91 @@ def _run_with_youtube_lookback(lookback_days: int, label: str):
             fut = ex.submit(fn)
             try:
                 res = fut.result(timeout=hard_timeout_s)
+                elapsed = time.time() - t0
+                print(f"[pipeline] <<< {name}: {len(res)} builds ({elapsed:.1f}s)", flush=True)
+                return res
             except concurrent.futures.TimeoutError:
                 elapsed = time.time() - t0
                 print(f"[pipeline] !!! {name} TIMED OUT after {elapsed:.1f}s — moving on", flush=True)
                 ex._threads.clear()
                 concurrent.futures.thread._threads_queues.clear()
-                return
+                return []
             except Exception as e:
                 elapsed = time.time() - t0
                 print(f"[pipeline] !!! {name} FAILED after {elapsed:.1f}s: {type(e).__name__}: {e}", flush=True)
-                return
-        elapsed = time.time() - t0
-        print(f"[pipeline] <<< {name}: {len(res)} builds ({elapsed:.1f}s)", flush=True)
-        builds.extend(res)
+                return []
 
-    # Site scrapers (codmunity + wzstats) use Gemini google_search grounding
-    # which is token-heavy (~50–100K each). On daily runs we skip them and
-    # rely on the cached codmunity whitelist from the last weekly run.
-    # On weekly runs we refresh both sites + wait 60s between heavy stages
-    # so the per-minute Gemini quota has time to recover before the next
-    # batch of grounded calls hits.
+    upserted = 0
+
+    def upsert_batch(builds: list[dict], source_label: str):
+        nonlocal upserted
+        if not builds:
+            return
+        n_ok = 0
+        for b in builds:
+            try:
+                upsert_build(b)
+                n_ok += 1
+            except Exception as e:
+                print(f"[pipeline] upsert failed for {b.get('weapon_name')}: {e}", flush=True)
+        upserted += n_ok
+        print(f"[pipeline] {source_label}: upserted {n_ok}/{len(builds)}", flush=True)
+
+    # ─── WIPE FIRST so any partial scraper results land in a clean slate.
+    # If a scraper crashes / times out mid-run, the rows that DID make it in
+    # before the crash are kept — much better than losing everything.
+    scope = WEEKLY_SCOPE if label == "weekly" else DAILY_SCOPE
+    deleted_total = delete_builds_by_play_style(scope)
+    print(f"[pipeline] wiped {deleted_total} rows across {len(scope)} in-scope play_styles ({label})", flush=True)
+
+    # ─── Site scrapers (weekly only, grounded → expensive)
+    sites_429ed = 0
     run_sites = ENABLE_GEMINI_SITES and label == "weekly"
     if run_sites:
-        step("codmunity", scrape_codmunity, hard_timeout_s=120)
+        cod_builds = run_step("codmunity", scrape_codmunity, hard_timeout_s=120)
+        upsert_batch(cod_builds, "Codmunity")
+        if not cod_builds:
+            sites_429ed += 1
         time.sleep(30)
-        step("wzstats", scrape_wzstats, hard_timeout_s=120)
-        # Cooldown so YT text calls (also grounded) don't immediately 429.
-        print("[pipeline] cooling down 60s before youtube_gemini …", flush=True)
-        time.sleep(60)
+
+        wzs_builds = run_step("wzstats", scrape_wzstats, hard_timeout_s=120)
+        upsert_batch(wzs_builds, "WZ Meta")
+        if not wzs_builds:
+            sites_429ed += 1
+
+        # If BOTH site scrapers returned zero, Gemini quota is almost
+        # certainly exhausted for the day. Skip YouTube — every call would
+        # 429 and grind the pipeline for 30 minutes burning quota.
+        if sites_429ed == 2:
+            print("[pipeline] codmunity AND wzstats both returned 0 — Gemini quota likely dead. Skipping youtube_gemini.", flush=True)
+        else:
+            print("[pipeline] cooling down 60s before youtube_gemini …", flush=True)
+            time.sleep(60)
     elif ENABLE_GEMINI_SITES:
         print(f"[pipeline] codmunity + wzstats SKIPPED (only run on weekly; this is {label})", flush=True)
     else:
         print("[pipeline] codmunity + wzstats SKIPPED (ENABLE_GEMINI_SITES=0)", flush=True)
 
-    step("wzhub", scrape_wzhub, hard_timeout_s=30)
-    step(
-        "youtube_gemini",
-        lambda: scrape_youtube_gemini(lookback_days=lookback_days),
-        hard_timeout_s=60 * 30,
-    )
+    # ─── wzhub — cheap, no API calls
+    wz_builds = run_step("wzhub", scrape_wzhub, hard_timeout_s=30)
+    upsert_batch(wz_builds, "WZ Hub")
 
-    # Scope of the wipe depends on the mode. Daily runs MUST leave the
-    # Codmunity / WZ Meta buckets alone — otherwise every daily empties
-    # the site data and we have to wait a week for it to repopulate.
-    scope = WEEKLY_SCOPE if label == "weekly" else DAILY_SCOPE
-    deleted_total = delete_builds_by_play_style(scope)
-    print(f"[pipeline] wiped {deleted_total} rows across {len(scope)} in-scope play_styles ({label})", flush=True)
+    # ─── youtube_gemini — most expensive, most fragile. Pass output_list so
+    # builds extracted before any timeout are preserved.
+    if not (run_sites and sites_429ed == 2):
+        yt_partial: list[dict] = []
+        run_step(
+            "youtube_gemini",
+            lambda: scrape_youtube_gemini(lookback_days=lookback_days, output_list=yt_partial),
+            hard_timeout_s=60 * 30,
+        )
+        # Upsert whatever made it into the shared list, even on timeout.
+        upsert_batch(yt_partial, "YouTube (partial-safe)")
 
-    if not builds:
-        print(f"[pipeline] {label}: nothing to upsert (all buckets now empty)")
-        log_scrape(label, 0, 0)
-        return 0
-
-    by_style: dict[str, list[dict]] = defaultdict(list)
-    for b in builds:
-        by_style[b.get("play_style") or "Unknown"].append(b)
-
-    upserted = 0
-    for play_style, style_builds in by_style.items():
-        print(f"[pipeline] {play_style}: upserting {len(style_builds)}", flush=True)
-        for b in style_builds:
-            try:
-                upsert_build(b)
-                upserted += 1
-            except Exception as e:
-                print(f"[pipeline] upsert failed for {b.get('weapon_name')}: {e}", flush=True)
-
-    log_scrape(label, len(builds), upserted)
-    print(f"[pipeline] {label}: {upserted} builds upserted across {len(by_style)} play_styles", flush=True)
+    if upserted == 0:
+        print(f"[pipeline] {label}: nothing was upserted")
+    log_scrape(label, upserted, upserted)
+    print(f"[pipeline] {label}: {upserted} builds upserted total", flush=True)
     return upserted
 
 

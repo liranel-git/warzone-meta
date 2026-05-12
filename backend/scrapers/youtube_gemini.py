@@ -90,6 +90,17 @@ BUILD_TITLE_KEYWORDS = [
 _VALID_WEAPONS_CACHE: dict[str, str] | None = None
 _WEAPON_TO_CLASS_CACHE: dict[str, str] | None = None
 
+# Fail-fast on persistent quota exhaustion. When `_quota_dead` flips True
+# every subsequent Gemini call short-circuits to [] without spending API
+# budget. Reset at the start of each scrape() invocation.
+_quota_dead = False
+_consecutive_429 = 0
+ABORT_429_THRESHOLD = 3
+
+
+class QuotaExhausted(Exception):
+    pass
+
 
 def _normalize_for_match(s: str) -> str:
     return re.sub(r"[\s\-_.]+", "", s.lower())
@@ -459,24 +470,45 @@ Return ONLY: {{"builds": [...]}}. Drop weapons not in the list.
 
 
 def _gemini_call_with_retry(make_request_fn, label: str, max_retries: int = 2) -> list[dict]:
-    """Generic retry wrapper for Gemini calls. make_request_fn() returns the response."""
+    """Generic retry wrapper for Gemini calls. make_request_fn() returns the response.
+    Tracks consecutive 429s in a module-level counter; once we hit
+    ABORT_429_THRESHOLD in a row, raise QuotaExhausted so the caller can
+    bail out of the whole channel sweep instead of grinding for 30 minutes."""
+    global _consecutive_429, _quota_dead
+
+    if _quota_dead:
+        return []  # short-circuit — quota already declared dead this run
+
     for attempt in range(max_retries + 1):
         try:
             resp = make_request_fn()
             text = (resp.text or "").strip()
             if not text:
+                _consecutive_429 = 0
                 return []
             parsed = _extract_json(text)
             builds = parsed.get("builds", [])
+            _consecutive_429 = 0
             return builds if isinstance(builds, list) else []
         except Exception as e:
             err = str(e)
             permission = "403" in err or "PERMISSION_DENIED" in err
             if permission:
                 print(f"[yt-gem] {label}: 403 (skipping)")
+                _consecutive_429 = 0
                 return []
-            transient = ("429" in err or "RESOURCE_EXHAUSTED" in err
-                         or "503" in err or "UNAVAILABLE" in err)
+
+            is_429 = "429" in err or "RESOURCE_EXHAUSTED" in err
+            is_503 = "503" in err or "UNAVAILABLE" in err
+            transient = is_429 or is_503
+
+            if is_429:
+                _consecutive_429 += 1
+                if _consecutive_429 >= ABORT_429_THRESHOLD:
+                    _quota_dead = True
+                    print(f"[yt-gem] {_consecutive_429} consecutive 429s — declaring quota dead, aborting")
+                    raise QuotaExhausted()
+
             if transient and attempt < max_retries:
                 m = re.search(r"retry in ([\d.]+)s", err)
                 wait = float(m.group(1)) if m else 30 * (attempt + 1)
@@ -614,7 +646,16 @@ def _extract_for_video(video_url: str, video_id: str, title: str,
 # Public entry point
 # ──────────────────────────────────────────────────────────────────────────
 
-def scrape(lookback_days: int = DEFAULT_LOOKBACK_DAYS) -> list[dict]:
+def scrape(lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+           output_list: list[dict] | None = None) -> list[dict]:
+    """Channel sweep. If `output_list` is provided, every validated build is
+    appended to it as soon as it's extracted — so even if this function gets
+    killed by the pipeline's hard-timeout, partial results are preserved
+    inside the caller's list."""
+    global _quota_dead, _consecutive_429
+    _quota_dead = False
+    _consecutive_429 = 0
+
     yt_key = os.environ.get("YOUTUBE_API_KEY")
     gem_key = os.environ.get("GEMINI_API_KEY")
     if not yt_key:
@@ -653,55 +694,72 @@ def scrape(lookback_days: int = DEFAULT_LOOKBACK_DAYS) -> list[dict]:
 
     final: list[dict] = []
 
-    for channel in CHANNELS:
-        ch_id = _resolve_channel_id(youtube, channel)
-        if not ch_id:
-            continue
+    try:
+        for channel in CHANNELS:
+            if _quota_dead:
+                print(f"[yt-gem] skipping {channel['name']} — quota dead")
+                continue
 
-        videos = _list_recent_videos(youtube, ch_id, after)
-        videos.sort(key=lambda v: v["publishedAt"], reverse=True)
-        videos = videos[:MAX_VIDEOS_PER_CHANNEL]
-        print(f"[yt-gem] {channel['name']}: {len(videos)} videos in last {lookback_days}d")
+            ch_id = _resolve_channel_id(youtube, channel)
+            if not ch_id:
+                continue
 
-        metas = _fetch_metadata(youtube, [v["videoId"] for v in videos])
+            videos = _list_recent_videos(youtube, ch_id, after)
+            videos.sort(key=lambda v: v["publishedAt"], reverse=True)
+            videos = videos[:MAX_VIDEOS_PER_CHANNEL]
+            print(f"[yt-gem] {channel['name']}: {len(videos)} videos in last {lookback_days}d")
 
-        # Per-channel dedupe by canonical weapon name (newest video wins)
-        seen: dict[str, dict] = {}
+            metas = _fetch_metadata(youtube, [v["videoId"] for v in videos])
 
-        for v in videos:
-            url = f"https://youtube.com/watch?v={v['videoId']}"
-            meta = metas.get(v["videoId"], {})
-            raw, method = _extract_for_video(url, v["videoId"], v["title"], meta, gemini)
-            time.sleep(SLEEP_BETWEEN_CALLS_S)
+            # Per-channel dedupe by canonical weapon name (newest video wins)
+            seen: dict[str, dict] = {}
 
-            valid_builds: list[dict] = []
-            for b in raw:
-                vb = _validate_build(b)
-                if vb:
-                    valid_builds.append(vb)
+            for v in videos:
+                if _quota_dead:
+                    break
+                url = f"https://youtube.com/watch?v={v['videoId']}"
+                meta = metas.get(v["videoId"], {})
+                try:
+                    raw, method = _extract_for_video(url, v["videoId"], v["title"], meta, gemini)
+                except QuotaExhausted:
+                    print(f"[yt-gem] {channel['name']}: quota dead mid-video, aborting channel")
+                    break
+                time.sleep(SLEEP_BETWEEN_CALLS_S)
 
-            names = ", ".join(b["weapon_name"] for b in valid_builds[:5])
-            print(f"[yt-gem]   {url} via {method}: {len(valid_builds)} valid / {len(raw)} raw [{names}]")
+                valid_builds: list[dict] = []
+                for b in raw:
+                    vb = _validate_build(b)
+                    if vb:
+                        valid_builds.append(vb)
 
-            for vb in valid_builds:
-                key = vb["weapon_name"].lower()
-                if key in seen:
-                    continue
-                seen[key] = {
-                    **vb,
-                    "game": "Warzone",
-                    "play_style": channel["play_style"],
-                    "source_type": "youtube",
-                    "source_url": url,
-                    "source_title": f"{channel['name']} — {v['title'][:80]}",
-                    "published_at": v["publishedAt"],
-                    "title": v["title"],
-                    "text": "",
-                    "upvotes": 0,
-                }
+                names = ", ".join(b["weapon_name"] for b in valid_builds[:5])
+                print(f"[yt-gem]   {url} via {method}: {len(valid_builds)} valid / {len(raw)} raw [{names}]")
 
-        final.extend(seen.values())
-        print(f"[yt-gem] {channel['name']}: {len(seen)} unique builds")
+                for vb in valid_builds:
+                    key = vb["weapon_name"].lower()
+                    if key in seen:
+                        continue
+                    enriched = {
+                        **vb,
+                        "game": "Warzone",
+                        "play_style": channel["play_style"],
+                        "source_type": "youtube",
+                        "source_url": url,
+                        "source_title": f"{channel['name']} — {v['title'][:80]}",
+                        "published_at": v["publishedAt"],
+                        "title": v["title"],
+                        "text": "",
+                        "upvotes": 0,
+                    }
+                    seen[key] = enriched
+                    # Incremental write so a later timeout can't lose this build.
+                    if output_list is not None:
+                        output_list.append(enriched)
 
-    print(f"[yt-gem] total builds across all channels: {len(final)}")
+            final.extend(seen.values())
+            print(f"[yt-gem] {channel['name']}: {len(seen)} unique builds")
+    except QuotaExhausted:
+        print(f"[yt-gem] outer abort — quota dead, returning {len(final)} partial builds")
+
+    print(f"[yt-gem] total builds across all channels: {len(final)} (output_list={len(output_list) if output_list is not None else '∅'})")
     return final
