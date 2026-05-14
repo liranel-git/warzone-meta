@@ -89,7 +89,9 @@ def _run_with_youtube_lookback(lookback_days: int, label: str):
         upserted += n_ok
         print(f"[pipeline] {source_label}: wiped {deleted}, upserted {n_ok}/{len(builds)} across {styles}", flush=True)
 
-    # ─── Site scrapers (weekly only, grounded → expensive)
+    # ─── Site scrapers (weekly only, grounded → expensive but fine on
+    # the paid tier). Short courtesy sleeps only — no longer free-tier
+    # quota survival hacks.
     sites_429ed = 0
     run_sites = ENABLE_GEMINI_SITES and label == "weekly"
     if run_sites:
@@ -97,21 +99,21 @@ def _run_with_youtube_lookback(lookback_days: int, label: str):
         upsert_batch(cod_builds, "Codmunity")
         if not cod_builds:
             sites_429ed += 1
-        time.sleep(30)
+        time.sleep(3)
 
         wzs_builds = run_step("wzstats", scrape_wzstats, hard_timeout_s=120)
         upsert_batch(wzs_builds, "WZ Meta")
         if not wzs_builds:
             sites_429ed += 1
 
-        # If BOTH site scrapers returned zero, Gemini quota is almost
-        # certainly exhausted for the day. Skip YouTube — every call would
-        # 429 and grind the pipeline for 30 minutes burning quota.
+        # If BOTH site scrapers returned zero something is genuinely
+        # wrong (network, key, both URLs dead). Still attempt YouTube —
+        # on the paid tier a transient blip on the sites shouldn't gate
+        # the whole run.
         if sites_429ed == 2:
-            print("[pipeline] codmunity AND wzstats both returned 0 — Gemini quota likely dead. Skipping youtube_gemini.", flush=True)
+            print("[pipeline] codmunity AND wzstats both returned 0 — continuing to youtube_gemini anyway (paid tier).", flush=True)
         else:
-            print("[pipeline] cooling down 60s before youtube_gemini …", flush=True)
-            time.sleep(60)
+            time.sleep(3)
     elif ENABLE_GEMINI_SITES:
         print(f"[pipeline] codmunity + wzstats SKIPPED (only run on weekly; this is {label})", flush=True)
     else:
@@ -122,16 +124,16 @@ def _run_with_youtube_lookback(lookback_days: int, label: str):
     upsert_batch(wz_builds, "WZ Hub")
 
     # ─── youtube_gemini — most expensive, most fragile. Pass output_list so
-    # builds extracted before any timeout are preserved.
-    if not (run_sites and sites_429ed == 2):
-        yt_partial: list[dict] = []
-        run_step(
-            "youtube_gemini",
-            lambda: scrape_youtube_gemini(lookback_days=lookback_days, output_list=yt_partial),
-            hard_timeout_s=60 * 30,
-        )
-        # Upsert whatever made it into the shared list, even on timeout.
-        upsert_batch(yt_partial, "YouTube (partial-safe)")
+    # builds extracted before any timeout are preserved. Always runs now
+    # (paid tier — a site-scraper blip no longer gates the YouTube pass).
+    yt_partial: list[dict] = []
+    run_step(
+        "youtube_gemini",
+        lambda: scrape_youtube_gemini(lookback_days=lookback_days, output_list=yt_partial),
+        hard_timeout_s=60 * 30,
+    )
+    # Upsert whatever made it into the shared list, even on timeout.
+    upsert_batch(yt_partial, "YouTube (partial-safe)")
 
     if upserted == 0:
         print(f"[pipeline] {label}: nothing was upserted")

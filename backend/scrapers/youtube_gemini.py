@@ -44,25 +44,27 @@ CHANNELS = [
 DEFAULT_LOOKBACK_DAYS = 7
 GEMINI_MODEL = "gemini-2.5-flash"
 
-# Pacing — text calls cost ~5–15K tokens each (vs 50–150K for video),
-# so we can do significantly more per minute.
-SLEEP_BETWEEN_CALLS_S = 6.0
-MAX_VIDEOS_PER_CHANNEL = 10
+# Pacing — on the paid Gemini tier (~1M tokens/min) text calls barely
+# dent the budget, so the inter-call sleep can be short. It's kept
+# non-zero only to be a polite API citizen.
+SLEEP_BETWEEN_CALLS_S = 2.0
+MAX_VIDEOS_PER_CHANNEL = 12
 
-# Visual usage is OFF by default — a single visual call burns ~50–100K
-# tokens, half the free-tier per-minute budget. Once quota is hit, every
-# subsequent call (incl. cheap text ones) gets 429 for 5+ minutes.
-# Set ENABLE_VISUAL_ENRICH=1 / ENABLE_VISUAL_FALLBACK=1 to opt in once
-# you're on a paid Gemini tier.
+# On the paid Gemini tier (Tier 1+) the per-minute budget is ~1M tokens,
+# so visual fallback is now affordable. Default ON; set to 0 to disable.
+# ENABLE_VISUAL_ENRICH stays OFF by default — it doubles call volume
+# (one visual call per build with empty attachments) and the text pass
+# with search grounding usually fills attachments well enough.
 ENABLE_VISUAL_ENRICH = os.environ.get("ENABLE_VISUAL_ENRICH", "0") == "1"
-ENABLE_VISUAL_FALLBACK = os.environ.get("ENABLE_VISUAL_FALLBACK", "0") == "1"
+ENABLE_VISUAL_FALLBACK = os.environ.get("ENABLE_VISUAL_FALLBACK", "1") == "1"
 
 # Visual fallback clip lengths (only used when ENABLE_VISUAL_FALLBACK=1)
 HEAD_S = 90
 TAIL_S = 90
 MIN_GAP_S = 30
-# Min seconds between two visual calls so we don't spike the quota.
-VISUAL_COOLDOWN_S = 60.0
+# Min seconds between two visual calls. On paid tier we can afford a much
+# shorter cooldown than the free-tier 60s.
+VISUAL_COOLDOWN_S = 10.0
 _last_visual_at = 0.0
 
 VALID_SLOTS = {
