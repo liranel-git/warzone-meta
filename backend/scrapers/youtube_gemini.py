@@ -51,11 +51,13 @@ SLEEP_BETWEEN_CALLS_S = 2.0
 MAX_VIDEOS_PER_CHANNEL = 12
 
 # On the paid Gemini tier (Tier 1+) the per-minute budget is ~1M tokens,
-# so visual fallback is now affordable. Default ON; set to 0 to disable.
-# ENABLE_VISUAL_ENRICH stays OFF by default — it doubles call volume
-# (one visual call per build with empty attachments) and the text pass
-# with search grounding usually fills attachments well enough.
-ENABLE_VISUAL_ENRICH = os.environ.get("ENABLE_VISUAL_ENRICH", "0") == "1"
+# so visual is now affordable. Both default ON:
+#   ENABLE_VISUAL_FALLBACK — text returned nothing → visual head+tail
+#                            clips to find which weapons appear.
+#   ENABLE_VISUAL_ENRICH   — text returned weapons but with empty
+#                            attachments → scan the FULL video to read
+#                            the gunsmith screen wherever it appears.
+ENABLE_VISUAL_ENRICH = os.environ.get("ENABLE_VISUAL_ENRICH", "1") == "1"
 ENABLE_VISUAL_FALLBACK = os.environ.get("ENABLE_VISUAL_FALLBACK", "1") == "1"
 
 # Visual fallback clip lengths (only used when ENABLE_VISUAL_FALLBACK=1)
@@ -540,10 +542,19 @@ def _gemini_text_call(prompt: str, client) -> list[dict]:
     )
 
 
-def _build_visual_content(video_url: str, duration_s: int):
+def _build_visual_content(video_url: str, duration_s: int, full: bool = False):
+    """Build a Gemini Content for visual analysis.
+    - full=False → head + tail clips only (cheap, used for the fallback
+      path where we just need to know which weapons appear).
+    - full=True  → the ENTIRE video, no clipping. Used when we already
+      know the weapons but couldn't get their attachments — the gunsmith
+      screen can appear anywhere in the video, so we must scan all of it."""
     from google.genai import types
     parts = []
-    if not duration_s or duration_s <= HEAD_S + MIN_GAP_S:
+    if full:
+        # Whole video, no clipping.
+        parts.append(types.Part(file_data=types.FileData(file_uri=video_url)))
+    elif not duration_s or duration_s <= HEAD_S + MIN_GAP_S:
         parts.append(types.Part(file_data=types.FileData(file_uri=video_url)))
     else:
         head_end = min(HEAD_S, duration_s)
@@ -561,8 +572,10 @@ def _build_visual_content(video_url: str, duration_s: int):
     return types.Content(parts=parts)
 
 
-def _gemini_visual_call(video_url: str, duration_s: int, client) -> list[dict]:
-    """Visual call respects a global cooldown so we don't blow the quota."""
+def _gemini_visual_call(video_url: str, duration_s: int, client,
+                        full: bool = False) -> list[dict]:
+    """Visual call respects a global cooldown so we don't blow the quota.
+    `full=True` sends the whole video instead of head+tail clips."""
     global _last_visual_at
     elapsed = time.time() - _last_visual_at
     if elapsed < VISUAL_COOLDOWN_S:
@@ -571,10 +584,10 @@ def _gemini_visual_call(video_url: str, duration_s: int, client) -> list[dict]:
         time.sleep(wait)
     _last_visual_at = time.time()
 
-    contents = _build_visual_content(video_url, duration_s)
+    contents = _build_visual_content(video_url, duration_s, full=full)
     return _gemini_call_with_retry(
         lambda: client.models.generate_content(model=GEMINI_MODEL, contents=contents),
-        label=f"visual({video_url})",
+        label=f"visual{'-full' if full else ''}({video_url})",
     )
 
 
@@ -585,20 +598,24 @@ def _looks_like_build_video(title: str) -> bool:
 
 def _enrich_attachments(text_builds: list[dict], video_url: str,
                         duration_s: int, client) -> list[dict]:
-    """If text-extracted builds have empty attachments, run a visual call to
-    fill them in. Visual extraction can read attachment slot/name pairs off
-    the loadout screen even when the creator doesn't say them verbally."""
+    """If text-extracted builds have empty attachments, scan the FULL video
+    to find them. The gunsmith / loadout screen can appear anywhere in the
+    video — not just the intro or outro — so we can't rely on head+tail
+    clips here. We send the entire video and merge whatever attachments
+    Gemini reads off-screen back onto the matching weapons."""
     needs = [b for b in text_builds if not (b.get("attachments") or [])]
-    if not needs or duration_s <= 0:
+    if not needs:
         return text_builds
 
-    print(f"[yt-gem]   enriching {len(needs)} build(s) with empty attachments via visual")
-    time.sleep(2)
-    visual_raw = _gemini_visual_call(video_url, duration_s, client)
+    missing_names = ", ".join(b.get("weapon_name", "?") for b in needs[:6])
+    print(f"[yt-gem]   {len(needs)} build(s) missing attachments [{missing_names}] — scanning FULL video")
+    time.sleep(1)
+    visual_raw = _gemini_visual_call(video_url, duration_s, client, full=True)
     if not visual_raw:
+        print(f"[yt-gem]   full-video scan returned nothing")
         return text_builds
 
-    # Map normalized weapon name → attachments seen in visual
+    # Map normalized weapon name → attachments seen in the full-video scan
     by_weapon: dict[str, list[str]] = {}
     for vb in visual_raw:
         name = _normalize_weapon_name(vb.get("weapon_name", ""))
@@ -606,12 +623,15 @@ def _enrich_attachments(text_builds: list[dict], video_url: str,
         if name and atts:
             by_weapon[name] = atts
 
+    filled = 0
     for b in text_builds:
         if b.get("attachments"):
             continue
         canonical = _normalize_weapon_name(b.get("weapon_name", ""))
         if canonical and canonical in by_weapon:
             b["attachments"] = by_weapon[canonical]
+            filled += 1
+    print(f"[yt-gem]   full-video scan filled attachments for {filled}/{len(needs)} build(s)")
 
     return text_builds
 

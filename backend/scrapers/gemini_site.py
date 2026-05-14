@@ -65,28 +65,29 @@ def _extract_json(text: str) -> dict:
 
 
 def _build_search_prompt(site_label: str, site_domain: str) -> str:
-    return f"""You are extracting the COMPLETE current Call of Duty: Warzone meta tier list from {site_label} ({site_domain}).
+    return f"""You are extracting the TOP of the current Call of Duty: Warzone meta tier list from {site_label} ({site_domain}).
 
 Today is May 2026 — Warzone is in the BO7 (Black Ops 7) era, Season 3.
 
-Use Google Search to look up {site_label}'s Warzone tier list. The site classifies dozens of weapons across multiple tiers (S/Meta, A, B, C, D/F or similar labels). Search for terms like "{site_domain} Warzone meta tier list", "{site_domain} best ARs", "{site_domain} best SMGs", "{site_domain} sniper tier list" — issue MULTIPLE search queries if needed to find every weapon class.
+Use Google Search to look up {site_label}'s Warzone tier list. Search terms like "{site_domain} Warzone meta tier list", "{site_domain} best ARs", "{site_domain} best SMGs", "{site_domain} sniper tier list" — issue MULTIPLE search queries if needed to cover every weapon class.
 
-For EACH weapon they rank, return strict JSON: {{"builds": [...]}} with these fields:
+**ONLY extract weapons in the top THREE tiers — "Absolute Meta", "Meta", and "A". OMIT everything the site rates lower (B, C, D, F, "not recommended", etc.) entirely. We only want the genuinely competitive picks.**
+
+For each qualifying weapon, return strict JSON: {{"builds": [...]}} with these fields:
 - weapon_name (string, exact in-game name, e.g. "MK.78", "Voyak KT-3", "VST", "Strider 300", "Razor 9mm", "Dravec 45")
 - weapon_class (AR, SMG, LMG, Sniper, Shotgun, Marksman, Pistol)
-- tier — map the site's label:
+- tier — map the site's label, but ONLY these three:
     S / Tier 1 / Meta / Top → "Absolute Meta"
     A / Tier 2 / Strong → "Meta"
     B / Tier 3 / Solid → "A"
-    C / Acceptable → "B"
-    D / F / Bad / Skip → "F"
+    (anything the site rates C / D / F / lower → DO NOT INCLUDE the weapon at all)
 - weapon_dominancy (Long Range, Close Range, Sniper, Support, Hip Fire, Aggressive, Lowest Recoil)
 - attachments — array of "<Slot>: <Name>" pairs using EXACT in-game names with brand prefixes (e.g. "Greaves Bellum Barrel", "Bowen Bighorn Drum", "Monolithic Suppressor"). DO NOT use generic terms like "18-inch barrel", "45 round mag", "FMJ ammunition" — those are placeholders and will be dropped. If you don't know the exact in-game name for a slot, OMIT that slot.
     Valid slots: Optic, Muzzle, Barrel, Underbarrel, Magazine, Stock, Rear Grip, Laser, Fire Mods, Conversion Kit, Bolt, Comb, Stock Pad, Ammunition, Trigger Action.
 - confidence (0.5–0.95)
 - reasoning (one short sentence — why the site recommends this build)
 
-**Target at least 25–35 weapons covering every tier the site publishes, every weapon class.** A 10-weapon response means you stopped too early — search harder.
+Target every weapon the site puts in its top three tiers, across every weapon class — typically 15–25 weapons.
 
 Return ONLY: {{"builds": [...]}}. No prose."""
 
@@ -142,15 +143,21 @@ def _scrape_via_search(site_label: str, site_domain: str, play_style: str,
     if not isinstance(raw_builds, list):
         return []
 
+    # Website sources only carry the top three tiers — drop anything else
+    # that slips through despite the prompt.
+    ALLOWED_TIERS = ("Absolute Meta", "Meta", "A")
+
     out = []
+    dropped_low_tier = 0
     for b in raw_builds:
         wname = (b.get("weapon_name") or "").strip()
         if not wname:
             continue
         wclass = (b.get("weapon_class") or "AR").strip()
         tier = b.get("tier") or "A"
-        if tier not in ("Absolute Meta", "Meta", "A", "B", "F"):
-            tier = "A"
+        if tier not in ALLOWED_TIERS:
+            dropped_low_tier += 1
+            continue  # B / F / unknown — omit for website sources
 
         out.append({
             "weapon_name": wname,
@@ -172,7 +179,8 @@ def _scrape_via_search(site_label: str, site_domain: str, play_style: str,
         })
 
     names = ", ".join(b["weapon_name"] for b in out[:5])
-    print(f"[gem-site] {site_label}: {len(out)} builds extracted [{names}{'...' if len(out) > 5 else ''}]")
+    suffix = f" (dropped {dropped_low_tier} below-A-tier)" if dropped_low_tier else ""
+    print(f"[gem-site] {site_label}: {len(out)} builds extracted{suffix} [{names}{'...' if len(out) > 5 else ''}]")
     return out
 
 
