@@ -184,6 +184,27 @@ def delete_builds_by_play_style(play_styles: list[str], game: str = "Warzone") -
         return cur.rowcount or 0
 
 
+def purge_low_tier(play_styles: list[str],
+                   keep_tiers: tuple[str, ...] = ("Absolute Meta", "Meta", "A"),
+                   game: str = "Warzone") -> int:
+    """Delete rows in the given play_style buckets whose tier is below A.
+    Website sources (Codmunity / WZ Meta / WZ Hub) should only ever carry
+    the top three tiers — this is a self-healing sweep so that stale rows
+    from before the tier filter (or from a scraper that has since stopped
+    returning data) don't linger in the UI."""
+    if not play_styles:
+        return 0
+    ps_ph = ",".join("?" * len(play_styles))
+    tier_ph = ",".join("?" * len(keep_tiers))
+    with get_conn() as conn:
+        cur = conn.execute(
+            f"DELETE FROM builds WHERE game = ? AND play_style IN ({ps_ph}) "
+            f"AND tier NOT IN ({tier_ph})",
+            [game, *play_styles, *keep_tiers],
+        )
+        return cur.rowcount or 0
+
+
 def log_scrape(source: str, items_scraped: int, builds_added: int):
     with get_conn() as conn:
         conn.execute(

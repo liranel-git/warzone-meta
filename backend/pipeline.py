@@ -19,7 +19,9 @@ from dotenv import load_dotenv
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
-from database import init_db, upsert_build, log_scrape, delete_builds_by_play_style
+from database import (
+    init_db, upsert_build, log_scrape, delete_builds_by_play_style, purge_low_tier
+)
 from scrapers.wzhub import scrape as scrape_wzhub
 from scrapers.youtube_gemini import scrape as scrape_youtube_gemini, CHANNELS as YT_CHANNELS
 from scrapers.gemini_site import scrape_codmunity, scrape_wzstats
@@ -134,6 +136,14 @@ def _run_with_youtube_lookback(lookback_days: int, label: str):
     )
     # Upsert whatever made it into the shared list, even on timeout.
     upsert_batch(yt_partial, "YouTube (partial-safe)")
+
+    # Self-healing sweep: website buckets must only carry Absolute Meta /
+    # Meta / A. This purges any below-A rows left over from a pre-tier-filter
+    # run, or from a scraper (codmunity) that has since stopped returning
+    # data so its bucket never got wiped+rewritten.
+    purged = purge_low_tier(["Codmunity", "WZ Meta", "WZ Hub"])
+    if purged:
+        print(f"[pipeline] purged {purged} below-A-tier rows from website buckets", flush=True)
 
     if upserted == 0:
         print(f"[pipeline] {label}: nothing was upserted")

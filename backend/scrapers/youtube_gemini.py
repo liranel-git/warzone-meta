@@ -78,6 +78,12 @@ FULL_SCAN_FPS = 0.5            # 1 frame every 2 seconds
 # the full scan entirely for anything longer than this (head+tail only).
 MAX_FULL_SCAN_DURATION_S = 75 * 60
 
+# A complete Warzone loadout has 5 attachment slots. If the text pass
+# returns fewer than this for a build (creator didn't list them all, or
+# the generic-name filter dropped some), we trigger the visual enrichment
+# to top it up to a full 5.
+TARGET_ATTACHMENT_COUNT = 5
+
 VALID_SLOTS = {
     "Optic", "Muzzle", "Barrel", "Underbarrel", "Magazine", "Stock",
     "Rear Grip", "Laser", "Fire Mods", "Conversion Kit", "Bolt",
@@ -418,6 +424,7 @@ Below is the creator's title, full description, and (if available) auto-captions
 Extract every weapon build the creator EXPLICITLY recommends as a CURRENT-meta loadout.
 
 STRICT FILTERING RULES:
+- The build must reflect what THIS video presents. Creators frequently leave stale loadout sections, old pinned links, or an outdated "my loadouts" block in the description — do NOT extract builds from those. Trust the video's title, transcript, and on-screen content over any older-looking description boilerplate.
 - IGNORE weapons the creator describes as old, outdated, or no longer meta.
 - IGNORE casual mentions like "I used this last season" or "back when X was meta".
 - IGNORE comparison clips that aren't recommendations.
@@ -627,8 +634,10 @@ def _looks_like_build_video(title: str) -> bool:
 
 
 def _merge_attachments(text_builds: list[dict], visual_raw: list[dict]) -> int:
-    """Merge attachments from a visual scan onto text builds that lack them.
-    Returns how many builds got filled."""
+    """Slot-merge attachments from a visual scan onto text builds that have
+    fewer than TARGET_ATTACHMENT_COUNT. The text build's own slots are
+    kept; the visual scan fills in whichever slots are still missing, up
+    to 5. Returns how many builds gained at least one attachment."""
     by_weapon: dict[str, list[str]] = {}
     for vb in visual_raw:
         name = _normalize_weapon_name(vb.get("weapon_name", ""))
@@ -638,57 +647,86 @@ def _merge_attachments(text_builds: list[dict], visual_raw: list[dict]) -> int:
 
     filled = 0
     for b in text_builds:
-        if b.get("attachments"):
+        existing = b.get("attachments") or []
+        if len(existing) >= TARGET_ATTACHMENT_COUNT:
             continue
         canonical = _normalize_weapon_name(b.get("weapon_name", ""))
-        if canonical and canonical in by_weapon:
-            b["attachments"] = by_weapon[canonical]
+        visual_atts = by_weapon.get(canonical) if canonical else None
+        if not visual_atts:
+            continue
+        existing_slots = {a.split(":", 1)[0].strip() for a in existing if ":" in a}
+        merged = list(existing)
+        for va in visual_atts:
+            if ":" not in va:
+                continue
+            slot = va.split(":", 1)[0].strip()
+            if slot not in existing_slots:
+                merged.append(va)
+                existing_slots.add(slot)
+            if len(merged) >= TARGET_ATTACHMENT_COUNT:
+                break
+        if len(merged) > len(existing):
+            b["attachments"] = merged
             filled += 1
     return filled
 
 
 def _enrich_attachments(text_builds: list[dict], video_url: str,
                         duration_s: int, client) -> list[dict]:
-    """Fill in attachments for text-extracted builds that came back empty.
+    """Top up builds that have fewer than 5 attachments. A complete Warzone
+    loadout has 5 slots — anything less means the text pass missed some
+    (creator didn't spell them all out, or the generic-name filter dropped
+    them). The visual scan reads the gunsmith screen, which is also the
+    most authoritative / freshest source for the build.
 
     Two-stage, cheapest-first:
-      1. Scan head + tail clips (creators usually show the loadout in the
-         intro or outro). Cheap.
-      2. ONLY if builds are still missing attachments after that, scan the
-         ENTIRE video — the gunsmith screen can be buried mid-video. More
-         expensive, so it's the last resort."""
-    needs = [b for b in text_builds if not (b.get("attachments") or [])]
+      1. head + tail clips (creators usually show the loadout intro/outro)
+      2. ONLY builds still under 5 → scan the full video (low fps/res)."""
+
+    def _under(b):
+        return len(b.get("attachments") or []) < TARGET_ATTACHMENT_COUNT
+
+    def _label(builds):
+        return ", ".join(
+            f"{b.get('weapon_name', '?')}({len(b.get('attachments') or [])})"
+            for b in builds[:6]
+        )
+
+    needs = [b for b in text_builds if _under(b)]
     if not needs:
         return text_builds
 
-    missing_names = ", ".join(b.get("weapon_name", "?") for b in needs[:6])
-    print(f"[yt-gem]   {len(needs)} build(s) missing attachments [{missing_names}] — scanning head+tail")
+    print(f"[yt-gem]   {len(needs)} build(s) under 5 attachments [{_label(needs)}] — scanning head+tail")
 
     # Stage 1: head + tail
     time.sleep(1)
     visual_raw = _gemini_visual_call(video_url, duration_s, client, full=False)
     if visual_raw:
         filled = _merge_attachments(text_builds, visual_raw)
-        print(f"[yt-gem]   head+tail scan filled {filled}/{len(needs)} build(s)")
+        print(f"[yt-gem]   head+tail scan topped up {filled}/{len(needs)} build(s)")
 
-    # Stage 2: still missing → full video (low fps + low res). Skip for
-    # very long videos — even sampled they won't fit Gemini's limits, and
-    # they're almost always stream VODs rather than build guides.
-    still_missing = [b for b in text_builds if not (b.get("attachments") or [])]
-    if still_missing:
-        sm_names = ", ".join(b.get("weapon_name", "?") for b in still_missing[:6])
+    # Stage 2: still under 5 → full video. Skip for very long videos —
+    # even sampled they won't fit Gemini's limits, and they're almost
+    # always stream VODs rather than build guides.
+    still = [b for b in text_builds if _under(b)]
+    if still:
         if duration_s and duration_s > MAX_FULL_SCAN_DURATION_S:
-            print(f"[yt-gem]   {len(still_missing)} still missing [{sm_names}] — "
+            print(f"[yt-gem]   {len(still)} still under 5 [{_label(still)}] — "
                   f"video too long ({duration_s // 60}min) for full scan, skipping")
         else:
-            print(f"[yt-gem]   {len(still_missing)} still missing [{sm_names}] — scanning FULL video")
+            print(f"[yt-gem]   {len(still)} still under 5 [{_label(still)}] — scanning FULL video")
             time.sleep(1)
             full_raw = _gemini_visual_call(video_url, duration_s, client, full=True)
             if full_raw:
                 filled = _merge_attachments(text_builds, full_raw)
-                print(f"[yt-gem]   full-video scan filled {filled}/{len(still_missing)} build(s)")
+                print(f"[yt-gem]   full-video scan topped up {filled}/{len(still)} build(s)")
             else:
                 print(f"[yt-gem]   full-video scan returned nothing")
+
+    # Final diagnostic — anything still under 5 is genuinely incomplete.
+    incomplete = [b for b in text_builds if _under(b)]
+    if incomplete:
+        print(f"[yt-gem]   ⚠ {len(incomplete)} build(s) STILL under 5 attachments [{_label(incomplete)}]")
 
     return text_builds
 
