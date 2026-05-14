@@ -596,26 +596,9 @@ def _looks_like_build_video(title: str) -> bool:
     return any(k in t for k in BUILD_TITLE_KEYWORDS)
 
 
-def _enrich_attachments(text_builds: list[dict], video_url: str,
-                        duration_s: int, client) -> list[dict]:
-    """If text-extracted builds have empty attachments, scan the FULL video
-    to find them. The gunsmith / loadout screen can appear anywhere in the
-    video — not just the intro or outro — so we can't rely on head+tail
-    clips here. We send the entire video and merge whatever attachments
-    Gemini reads off-screen back onto the matching weapons."""
-    needs = [b for b in text_builds if not (b.get("attachments") or [])]
-    if not needs:
-        return text_builds
-
-    missing_names = ", ".join(b.get("weapon_name", "?") for b in needs[:6])
-    print(f"[yt-gem]   {len(needs)} build(s) missing attachments [{missing_names}] — scanning FULL video")
-    time.sleep(1)
-    visual_raw = _gemini_visual_call(video_url, duration_s, client, full=True)
-    if not visual_raw:
-        print(f"[yt-gem]   full-video scan returned nothing")
-        return text_builds
-
-    # Map normalized weapon name → attachments seen in the full-video scan
+def _merge_attachments(text_builds: list[dict], visual_raw: list[dict]) -> int:
+    """Merge attachments from a visual scan onto text builds that lack them.
+    Returns how many builds got filled."""
     by_weapon: dict[str, list[str]] = {}
     for vb in visual_raw:
         name = _normalize_weapon_name(vb.get("weapon_name", ""))
@@ -631,7 +614,45 @@ def _enrich_attachments(text_builds: list[dict], video_url: str,
         if canonical and canonical in by_weapon:
             b["attachments"] = by_weapon[canonical]
             filled += 1
-    print(f"[yt-gem]   full-video scan filled attachments for {filled}/{len(needs)} build(s)")
+    return filled
+
+
+def _enrich_attachments(text_builds: list[dict], video_url: str,
+                        duration_s: int, client) -> list[dict]:
+    """Fill in attachments for text-extracted builds that came back empty.
+
+    Two-stage, cheapest-first:
+      1. Scan head + tail clips (creators usually show the loadout in the
+         intro or outro). Cheap.
+      2. ONLY if builds are still missing attachments after that, scan the
+         ENTIRE video — the gunsmith screen can be buried mid-video. More
+         expensive, so it's the last resort."""
+    needs = [b for b in text_builds if not (b.get("attachments") or [])]
+    if not needs:
+        return text_builds
+
+    missing_names = ", ".join(b.get("weapon_name", "?") for b in needs[:6])
+    print(f"[yt-gem]   {len(needs)} build(s) missing attachments [{missing_names}] — scanning head+tail")
+
+    # Stage 1: head + tail
+    time.sleep(1)
+    visual_raw = _gemini_visual_call(video_url, duration_s, client, full=False)
+    if visual_raw:
+        filled = _merge_attachments(text_builds, visual_raw)
+        print(f"[yt-gem]   head+tail scan filled {filled}/{len(needs)} build(s)")
+
+    # Stage 2: still missing → full video
+    still_missing = [b for b in text_builds if not (b.get("attachments") or [])]
+    if still_missing:
+        sm_names = ", ".join(b.get("weapon_name", "?") for b in still_missing[:6])
+        print(f"[yt-gem]   {len(still_missing)} still missing [{sm_names}] — scanning FULL video")
+        time.sleep(1)
+        full_raw = _gemini_visual_call(video_url, duration_s, client, full=True)
+        if full_raw:
+            filled = _merge_attachments(text_builds, full_raw)
+            print(f"[yt-gem]   full-video scan filled {filled}/{len(still_missing)} build(s)")
+        else:
+            print(f"[yt-gem]   full-video scan returned nothing")
 
     return text_builds
 

@@ -356,8 +356,17 @@ def scrape() -> list[dict]:
     except Exception as e:
         print(f"[wzhub] live fetch failed: {e} — using embedded dataset")
 
+    # Website sources only carry the top three tiers (Absolute Meta / Meta
+    # / A). B and F tier weapons are omitted — the app only surfaces the
+    # genuinely competitive picks from website sources.
+    ALLOWED_TIERS = ("Absolute Meta", "Meta", "A")
+
     result = []
+    dropped = 0
     for b in WARZONE_BUILDS:
+        if b["tier"] not in ALLOWED_TIERS:
+            dropped += 1
+            continue
         # In the new schema, play_style identifies the source ("WZ Hub")
         # and weapon_dominancy holds the old style label (Long Range, etc.)
         result.append({
@@ -373,5 +382,5 @@ def scrape() -> list[dict]:
             "source_url": WZHUB_URL,
             "source_title": "wzhub.gg — Warzone Meta Season 3",
         })
-    print(f"[wzhub] returning {len(result)} builds")
+    print(f"[wzhub] returning {len(result)} builds (dropped {dropped} below-A-tier)")
     return result
