@@ -69,6 +69,15 @@ MIN_GAP_S = 30
 VISUAL_COOLDOWN_S = 10.0
 _last_visual_at = 0.0
 
+# Full-video attachment scans: a long video at the default 1fps blows
+# Gemini's hard limits (1,048,576 input tokens / 10,800 images). So for
+# full scans we sample at a low fps and request low media resolution —
+# we only need to catch the gunsmith screen, which stays up for seconds.
+FULL_SCAN_FPS = 0.5            # 1 frame every 2 seconds
+# Even at 0.5fps + low-res, multi-hour stream VODs still won't fit. Skip
+# the full scan entirely for anything longer than this (head+tail only).
+MAX_FULL_SCAN_DURATION_S = 75 * 60
+
 VALID_SLOTS = {
     "Optic", "Muzzle", "Barrel", "Underbarrel", "Magazine", "Stock",
     "Rear Grip", "Laser", "Fire Mods", "Conversion Kit", "Bolt",
@@ -552,8 +561,12 @@ def _build_visual_content(video_url: str, duration_s: int, full: bool = False):
     from google.genai import types
     parts = []
     if full:
-        # Whole video, no clipping.
-        parts.append(types.Part(file_data=types.FileData(file_uri=video_url)))
+        # Whole video, no clipping — but sample at a low fps so long
+        # videos don't blow the 1M-token / 10800-image ceiling.
+        parts.append(types.Part(
+            file_data=types.FileData(file_uri=video_url),
+            video_metadata=types.VideoMetadata(fps=FULL_SCAN_FPS),
+        ))
     elif not duration_s or duration_s <= HEAD_S + MIN_GAP_S:
         parts.append(types.Part(file_data=types.FileData(file_uri=video_url)))
     else:
@@ -575,7 +588,8 @@ def _build_visual_content(video_url: str, duration_s: int, full: bool = False):
 def _gemini_visual_call(video_url: str, duration_s: int, client,
                         full: bool = False) -> list[dict]:
     """Visual call respects a global cooldown so we don't blow the quota.
-    `full=True` sends the whole video instead of head+tail clips."""
+    `full=True` sends the whole video (low fps + low resolution) instead
+    of head+tail clips."""
     global _last_visual_at
     elapsed = time.time() - _last_visual_at
     if elapsed < VISUAL_COOLDOWN_S:
@@ -585,8 +599,24 @@ def _gemini_visual_call(video_url: str, duration_s: int, client,
     _last_visual_at = time.time()
 
     contents = _build_visual_content(video_url, duration_s, full=full)
+
+    config = None
+    if full:
+        # Low media resolution slashes per-frame tokens (~258 → ~66),
+        # keeping even hour-long videos under the 1M-token ceiling.
+        from google.genai import types
+        config = types.GenerateContentConfig(
+            media_resolution=types.MediaResolution.MEDIA_RESOLUTION_LOW,
+        )
+
+    def _request():
+        kwargs = {"model": GEMINI_MODEL, "contents": contents}
+        if config is not None:
+            kwargs["config"] = config
+        return client.models.generate_content(**kwargs)
+
     return _gemini_call_with_retry(
-        lambda: client.models.generate_content(model=GEMINI_MODEL, contents=contents),
+        _request,
         label=f"visual{'-full' if full else ''}({video_url})",
     )
 
@@ -641,18 +671,24 @@ def _enrich_attachments(text_builds: list[dict], video_url: str,
         filled = _merge_attachments(text_builds, visual_raw)
         print(f"[yt-gem]   head+tail scan filled {filled}/{len(needs)} build(s)")
 
-    # Stage 2: still missing → full video
+    # Stage 2: still missing → full video (low fps + low res). Skip for
+    # very long videos — even sampled they won't fit Gemini's limits, and
+    # they're almost always stream VODs rather than build guides.
     still_missing = [b for b in text_builds if not (b.get("attachments") or [])]
     if still_missing:
         sm_names = ", ".join(b.get("weapon_name", "?") for b in still_missing[:6])
-        print(f"[yt-gem]   {len(still_missing)} still missing [{sm_names}] — scanning FULL video")
-        time.sleep(1)
-        full_raw = _gemini_visual_call(video_url, duration_s, client, full=True)
-        if full_raw:
-            filled = _merge_attachments(text_builds, full_raw)
-            print(f"[yt-gem]   full-video scan filled {filled}/{len(still_missing)} build(s)")
+        if duration_s and duration_s > MAX_FULL_SCAN_DURATION_S:
+            print(f"[yt-gem]   {len(still_missing)} still missing [{sm_names}] — "
+                  f"video too long ({duration_s // 60}min) for full scan, skipping")
         else:
-            print(f"[yt-gem]   full-video scan returned nothing")
+            print(f"[yt-gem]   {len(still_missing)} still missing [{sm_names}] — scanning FULL video")
+            time.sleep(1)
+            full_raw = _gemini_visual_call(video_url, duration_s, client, full=True)
+            if full_raw:
+                filled = _merge_attachments(text_builds, full_raw)
+                print(f"[yt-gem]   full-video scan filled {filled}/{len(still_missing)} build(s)")
+            else:
+                print(f"[yt-gem]   full-video scan returned nothing")
 
     return text_builds
 
