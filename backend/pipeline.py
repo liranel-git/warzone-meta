@@ -29,16 +29,13 @@ from scrapers.gemini_site import scrape_codmunity, scrape_wzstats
 # url_context approach). Default ON; set ENABLE_GEMINI_SITES=0 to skip.
 ENABLE_GEMINI_SITES = os.environ.get("ENABLE_GEMINI_SITES", "1") == "1"
 
-# Bucket groupings — used to scope the per-run wipe.
-SITE_PLAY_STYLES: list[str] = ["Codmunity", "WZ Meta"]
-WZHUB_PLAY_STYLE: str = "WZ Hub"
-YT_PLAY_STYLES: list[str] = [ch["play_style"] for ch in YT_CHANNELS]
-
-# Daily runs refresh ONLY wzhub + YouTube channels. Codmunity / WZ Meta
-# are weekly-only (their grounded calls are expensive). So a daily run
-# must NOT wipe those buckets, or they go blank between weekly runs.
-DAILY_SCOPE: list[str] = [WZHUB_PLAY_STYLE] + YT_PLAY_STYLES
-WEEKLY_SCOPE: list[str] = SITE_PLAY_STYLES + [WZHUB_PLAY_STYLE] + YT_PLAY_STYLES
+# NOTE: there is no longer an up-front scope wipe. Each scraper's
+# upsert_batch() wipes ONLY the play_style buckets it actually produced
+# data for (see upsert_batch below). This means:
+#   - A daily run never touches Codmunity / WZ Meta (those scrapers don't
+#     run on daily, so no batch carries those play_styles).
+#   - A failed/empty scrape leaves its bucket's existing data intact
+#     instead of nuking it.
 
 
 def _run_with_youtube_lookback(lookback_days: int, label: str):
@@ -72,9 +69,16 @@ def _run_with_youtube_lookback(lookback_days: int, label: str):
     upserted = 0
 
     def upsert_batch(builds: list[dict], source_label: str):
+        """Wipe-then-insert, but ONLY for the play_style buckets actually
+        present in `builds`. A scraper that returned nothing (429, timeout,
+        no videos) leaves its existing bucket untouched — a failed scrape
+        must never destroy data that's already there."""
         nonlocal upserted
         if not builds:
+            print(f"[pipeline] {source_label}: 0 builds — existing data left intact", flush=True)
             return
+        styles = sorted({b.get("play_style") for b in builds if b.get("play_style")})
+        deleted = delete_builds_by_play_style(styles)
         n_ok = 0
         for b in builds:
             try:
@@ -83,14 +87,7 @@ def _run_with_youtube_lookback(lookback_days: int, label: str):
             except Exception as e:
                 print(f"[pipeline] upsert failed for {b.get('weapon_name')}: {e}", flush=True)
         upserted += n_ok
-        print(f"[pipeline] {source_label}: upserted {n_ok}/{len(builds)}", flush=True)
-
-    # ─── WIPE FIRST so any partial scraper results land in a clean slate.
-    # If a scraper crashes / times out mid-run, the rows that DID make it in
-    # before the crash are kept — much better than losing everything.
-    scope = WEEKLY_SCOPE if label == "weekly" else DAILY_SCOPE
-    deleted_total = delete_builds_by_play_style(scope)
-    print(f"[pipeline] wiped {deleted_total} rows across {len(scope)} in-scope play_styles ({label})", flush=True)
+        print(f"[pipeline] {source_label}: wiped {deleted}, upserted {n_ok}/{len(builds)} across {styles}", flush=True)
 
     # ─── Site scrapers (weekly only, grounded → expensive)
     sites_429ed = 0
