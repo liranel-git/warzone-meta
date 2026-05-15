@@ -132,7 +132,7 @@ def _run_with_youtube_lookback(lookback_days: int, label: str):
     run_step(
         "youtube_gemini",
         lambda: scrape_youtube_gemini(lookback_days=lookback_days, output_list=yt_partial),
-        hard_timeout_s=60 * 50,  # 50 min — last run timed out at 30 mid-channel
+        hard_timeout_s=60 * 60,  # 60 min — enrichment-heavy runs need the room
     )
     # Upsert whatever made it into the shared list, even on timeout.
     upsert_batch(yt_partial, "YouTube (partial-safe)")

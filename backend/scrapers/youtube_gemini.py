@@ -468,6 +468,38 @@ TRANSCRIPT:
 """
 
 
+def _build_visual_enrich_prompt(weapon_names: list[str]) -> str:
+    """Targeted prompt for ENRICHMENT visual scans — we already know which
+    weapons the video covers; we just need attachments for them. Much more
+    focused than the generic 'find all builds' visual prompt."""
+    names_str = "\n  - ".join(weapon_names)
+    return f"""You are analysing a Call of Duty: Warzone YouTube video to extract attachment lists.
+
+We've already identified that this video showcases builds for these specific weapons:
+  - {names_str}
+
+Your ONLY job is to find each weapon's gunsmith / loadout screen anywhere in the footage you can see, and read off the EXACT attachment names shown.
+
+Today is {_today_label()}. Warzone is in the BO7 era. Real in-game attachments have brand-prefixed names (examples for reference):
+  Optic:     "Greaves Accuspot 3X", "Lethal Tools ELO", "Fang Hoverpoint ELO"
+  Muzzle:    "Monolithic Suppressor", "Hawker Series 45", "EAM Finset Brake"
+  Barrel:    "17.6\\" LTI Grav-4 Barrel", "Bowen Resistor Barrel", "Greaves Bellum Barrel"
+  Underbarrel: "VAS Drift Lock Foregrip", "Lateral Precision Grip"
+  Magazine:  "SK-Garrison Drum", "Bowen Siren Drum", "Avarice Extended Mag II"
+  Stock:     "V-Last Control Pad", "Itinerant Light Stock"
+  Rear Grip: "Hatch Quick Grip", "Caravan-H2 Grip"
+  Fire Mods: "5.56 NATO FMJ", "Accelerated Recoil System"
+
+DO NOT return generic descriptions like "18-inch barrel", "45 round mag", "Long Barrel", "Suppressor" with no brand prefix — those will be dropped. If you can read the brand-prefixed name, use it. If you can't read the screen clearly for a slot, omit that slot.
+
+Return strict JSON: {{"builds": [...]}}. Each build:
+  - weapon_name: must be EXACTLY one of the names listed above
+  - attachments: array of "<Slot>: <Name>" — Slot in: Optic, Muzzle, Barrel, Underbarrel, Magazine, Stock, Rear Grip, Laser, Fire Mods, Conversion Kit, Bolt, Comb, Stock Pad, Ammunition, Trigger Action.
+
+Aim for 5 attachments per weapon (a complete loadout has 5 slots). If a weapon doesn't appear on a clear gunsmith screen, omit it from the result rather than guessing.
+"""
+
+
 def _build_visual_prompt() -> str:
     return f"""You are analysing a Call of Duty: Warzone meta-build YouTube video. The clips are the BEGINNING and END of the video — where creators usually showcase loadouts.
 
@@ -558,7 +590,8 @@ def _gemini_text_call(prompt: str, client) -> list[dict]:
     )
 
 
-def _build_visual_content(video_url: str, duration_s: int, full: bool = False):
+def _build_visual_content(video_url: str, duration_s: int, full: bool = False,
+                          prompt_override: str | None = None):
     """Build a Gemini Content for visual analysis.
     - full=False → head + tail clips only (cheap, used for the fallback
       path where we just need to know which weapons appear).
@@ -588,15 +621,17 @@ def _build_visual_content(video_url: str, duration_s: int, full: bool = False):
                 file_data=types.FileData(file_uri=video_url),
                 video_metadata=types.VideoMetadata(start_offset=f"{tail_start}s", end_offset=f"{duration_s}s"),
             ))
-    parts.append(types.Part(text=_build_visual_prompt()))
+    parts.append(types.Part(text=prompt_override or _build_visual_prompt()))
     return types.Content(parts=parts)
 
 
 def _gemini_visual_call(video_url: str, duration_s: int, client,
-                        full: bool = False) -> list[dict]:
+                        full: bool = False,
+                        prompt_override: str | None = None) -> list[dict]:
     """Visual call respects a global cooldown so we don't blow the quota.
     `full=True` sends the whole video (low fps + low resolution) instead
-    of head+tail clips."""
+    of head+tail clips. `prompt_override` lets the caller swap in a
+    targeted prompt (e.g. enrichment prompt that names specific weapons)."""
     global _last_visual_at
     elapsed = time.time() - _last_visual_at
     if elapsed < VISUAL_COOLDOWN_S:
@@ -605,7 +640,8 @@ def _gemini_visual_call(video_url: str, duration_s: int, client,
         time.sleep(wait)
     _last_visual_at = time.time()
 
-    contents = _build_visual_content(video_url, duration_s, full=full)
+    contents = _build_visual_content(video_url, duration_s, full=full,
+                                     prompt_override=prompt_override)
 
     config = None
     if full:
@@ -696,18 +732,25 @@ def _enrich_attachments(text_builds: list[dict], video_url: str,
     if not needs:
         return text_builds
 
+    # Targeted enrichment prompt — name the specific weapons we need
+    # attachments for instead of asking Gemini to find ALL builds. Much
+    # more focused → returns useful data more often.
+    target_names = [b.get("weapon_name", "") for b in needs if b.get("weapon_name")]
+    enrich_prompt = _build_visual_enrich_prompt(target_names)
+
     print(f"[yt-gem]   {len(needs)} build(s) under 5 attachments [{_label(needs)}] — scanning head+tail")
 
-    # Stage 1: head + tail
+    # Stage 1: head + tail with targeted prompt
     time.sleep(1)
-    visual_raw = _gemini_visual_call(video_url, duration_s, client, full=False)
+    visual_raw = _gemini_visual_call(video_url, duration_s, client, full=False,
+                                     prompt_override=enrich_prompt)
     if visual_raw:
         filled = _merge_attachments(text_builds, visual_raw)
         print(f"[yt-gem]   head+tail scan topped up {filled}/{len(needs)} build(s)")
 
-    # Stage 2: still under 5 → full video. Skip for very long videos —
-    # even sampled they won't fit Gemini's limits, and they're almost
-    # always stream VODs rather than build guides.
+    # Stage 2: still under 5 → full video (targeted prompt). Skip for very
+    # long videos — even sampled they won't fit Gemini's limits, and
+    # they're almost always stream VODs rather than build guides.
     still = [b for b in text_builds if _under(b)]
     if still:
         if duration_s and duration_s > MAX_FULL_SCAN_DURATION_S:
@@ -716,7 +759,10 @@ def _enrich_attachments(text_builds: list[dict], video_url: str,
         else:
             print(f"[yt-gem]   {len(still)} still under 5 [{_label(still)}] — scanning FULL video")
             time.sleep(1)
-            full_raw = _gemini_visual_call(video_url, duration_s, client, full=True)
+            # Re-derive target names from what's still missing
+            still_names = [b.get("weapon_name", "") for b in still if b.get("weapon_name")]
+            full_raw = _gemini_visual_call(video_url, duration_s, client, full=True,
+                                           prompt_override=_build_visual_enrich_prompt(still_names))
             if full_raw:
                 filled = _merge_attachments(text_builds, full_raw)
                 print(f"[yt-gem]   full-video scan topped up {filled}/{len(still)} build(s)")
