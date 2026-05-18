@@ -83,6 +83,11 @@ MAX_FULL_SCAN_DURATION_S = 75 * 60
 # the generic-name filter dropped some), we trigger the visual enrichment
 # to top it up to a full 5.
 TARGET_ATTACHMENT_COUNT = 5
+# Drop builds whose final attachment count is below this — too sparse to
+# be useful. Default 4: keep "almost-complete" 4-attachment builds, drop
+# 0/1/2/3-attachment partials. Set MIN_ATTACHMENT_COUNT=5 to be strictest
+# (drops anything less than complete), or =3 to keep more.
+MIN_ATTACHMENT_COUNT = int(os.environ.get("MIN_ATTACHMENT_COUNT", "4"))
 
 VALID_SLOTS = {
     "Optic", "Muzzle", "Barrel", "Underbarrel", "Magazine", "Stock",
@@ -450,6 +455,9 @@ For each qualifying build, return strict JSON with these fields:
       ✗ "FMJ ammunition"  → use the in-game name like "5.56 NATO FMJ"
       ✗ "extended mag"    → use the specific extended mag's brand name
     If you cannot find the exact in-game attachment name in the description, transcript, or search results, OMIT that slot entirely. An empty attachments array is far better than fabricated names.
+
+CRITICAL — INCOMPLETENESS RULE:
+If you can only find fewer than {MIN_ATTACHMENT_COUNT} attachments with proper brand-prefixed names for a weapon, OMIT THE WEAPON FROM THE OUTPUT ENTIRELY. A partial 1- or 2-attachment build is misleading — better to return nothing for that weapon. The pipeline will filter and drop such partials anyway.
     Slot must be one of: Optic, Muzzle, Barrel, Underbarrel, Magazine, Stock, Rear Grip, Laser, Fire Mods, Conversion Kit, Bolt, Comb, Stock Pad, Ammunition, Trigger Action.
 - confidence: 0.0–1.0 — high if the creator gives a full clear recommendation; low if it's a fleeting mention.
 - reasoning: one short sentence (paraphrase the creator's reasoning).
@@ -496,7 +504,7 @@ Return strict JSON: {{"builds": [...]}}. Each build:
   - weapon_name: must be EXACTLY one of the names listed above
   - attachments: array of "<Slot>: <Name>" — Slot in: Optic, Muzzle, Barrel, Underbarrel, Magazine, Stock, Rear Grip, Laser, Fire Mods, Conversion Kit, Bolt, Comb, Stock Pad, Ammunition, Trigger Action.
 
-Aim for 5 attachments per weapon (a complete loadout has 5 slots). If a weapon doesn't appear on a clear gunsmith screen, omit it from the result rather than guessing.
+Aim for 5 attachments per weapon (a complete loadout has 5 slots). If a weapon doesn't appear on a clear gunsmith screen, OR you can only read fewer than {MIN_ATTACHMENT_COUNT} of its attachments clearly, OMIT THE WEAPON ENTIRELY from your output — a partial build is worse than no entry.
 """
 
 
@@ -890,13 +898,25 @@ def scrape(lookback_days: int = DEFAULT_LOOKBACK_DAYS,
                 time.sleep(SLEEP_BETWEEN_CALLS_S)
 
                 valid_builds: list[dict] = []
+                dropped_incomplete: list[str] = []
                 for b in raw:
                     vb = _validate_build(b)
-                    if vb:
-                        valid_builds.append(vb)
+                    if not vb:
+                        continue
+                    # Drop builds whose final attachment count is below the
+                    # minimum — too sparse to be useful in the UI.
+                    if len(vb.get("attachments") or []) < MIN_ATTACHMENT_COUNT:
+                        dropped_incomplete.append(
+                            f"{vb['weapon_name']}({len(vb.get('attachments') or [])})"
+                        )
+                        continue
+                    valid_builds.append(vb)
 
                 names = ", ".join(b["weapon_name"] for b in valid_builds[:5])
-                print(f"[yt-gem]   {url} via {method}: {len(valid_builds)} valid / {len(raw)} raw [{names}]")
+                extra = ""
+                if dropped_incomplete:
+                    extra = f", dropped {len(dropped_incomplete)} <{MIN_ATTACHMENT_COUNT}-att [{', '.join(dropped_incomplete[:6])}]"
+                print(f"[yt-gem]   {url} via {method}: {len(valid_builds)} kept / {len(raw)} raw [{names}]{extra}")
 
                 for vb in valid_builds:
                     key = vb["weapon_name"].lower()
